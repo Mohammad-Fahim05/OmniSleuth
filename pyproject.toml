@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnisleuth"
+version = "0.1.0"
+description = "OmniSleuth: An Evidence-Grounded Multi-Agent Data Investigation System"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "OmniSleuth Team"}
+]
+dependencies = [
+    "pandas>=2.1.0",
+    "numpy>=1.26.0",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+    "scikit-learn>=1.4.0",
+    "plotly>=5.19.0",
+    "python-dotenv>=1.0.0",
+    "openpyxl>=3.1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+]
+rag = [
+    "langchain>=0.2.0",
+    "langchain-community>=0.2.0",
+    "langchain-openai>=0.1.0",
+    "langgraph>=0.1.0",
+    "chromadb>=0.4.22",
+    "pypdf>=4.0.0",
+]
+ui = [
+    "streamlit>=1.32.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["omnisleuth*"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
