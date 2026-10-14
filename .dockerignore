@@ -1,0 +1,39 @@
+# Version control & IDE
+.git/
+.github/
+.vscode/
+.idea/
+
+# Python virtual environment & cache
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Logs & Temporary files
+*.log
+*.tmp
+*.temp
+tmp/
+
+# Secrets & Local configuration
+.env
+*.local
+
+# Packaging & Build artifacts
+dist/
+build/
+*.egg-info/
+omnisleuth.egg-info/
+
+# Artifacts / Brain data
+.system_generated/

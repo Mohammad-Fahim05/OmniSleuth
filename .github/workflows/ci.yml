@@ -1,0 +1,109 @@
+name: OmniSleuth CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-format:
+    name: Code Quality & Syntax Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff flake8
+
+      - name: Syntax and Import Linting
+        run: |
+          # Stop build on Python syntax errors or undefined names
+          flake8 omnisleuth tests --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Warning check for complexity
+          flake8 omnisleuth --count --exit-zero --max-complexity=15 --max-line-length=120 --statistics
+
+  test-matrix:
+    name: Test Suite (Python ${{ matrix.python-version }} on ${{ matrix.os }})
+    needs: lint-and-format
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Run Full Pytest Suite (Offline Verification)
+        env:
+          APP_ENV: testing
+          LOG_LEVEL: INFO
+        run: |
+          python -m pytest tests/ -v --tb=short --cov=omnisleuth --cov-report=term-missing --cov-report=xml
+
+      - name: Upload Coverage Artifact
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  docker-build:
+    name: Container Build & Healthcheck Verification
+    needs: test-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: actions/setup-buildx-action@v3
+
+      - name: Build OmniSleuth Container Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: omnisleuth:ci
+          load: true
+
+      - name: Test Container Run & Health Check
+        run: |
+          # Run container in detached mode
+          docker run -d --name test-omnisleuth -p 8501:8501 -e PORT=8501 omnisleuth:ci
+          # Wait for Streamlit server to start up
+          sleep 5
+          # Verify health check endpoint returns 200 OK
+          docker exec test-omnisleuth curl --fail http://localhost:8501/_stcore/health || (docker logs test-omnisleuth && exit 1)
+          # Stop and cleanup container
+          docker stop test-omnisleuth
+          docker rm test-omnisleuth

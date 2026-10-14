@@ -1,0 +1,26 @@
+services:
+  omnisleuth:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: omnisleuth:latest
+    container_name: omnisleuth-app
+    ports:
+      - "8501:8501"
+    environment:
+      - PORT=8501
+      - APP_ENV=production
+      - LOG_LEVEL=INFO
+      - DATABASE_URL=sqlite:////app/persisted_data/omnisleuth.db
+    env_file:
+      - .env.example
+    volumes:
+      - ./data:/app/data
+      - ./persisted_data:/app/persisted_data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
