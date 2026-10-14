@@ -8,12 +8,22 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from omnisleuth.agents import MultiAgentOrchestrator
+from omnisleuth.core.config import get_settings
 from omnisleuth.discovery import DatasetDiscoveryScanner
 from omnisleuth.evaluation import BENCHMARK_QUESTIONS, OmniSleuthEvaluator, generate_benchmark_sales_dataset
-from omnisleuth.evidence.models import ClaimStatus, EvidenceType, HypothesisStatus
+from omnisleuth.evidence.models import (
+    Claim,
+    ClaimStatus,
+    EvidenceItem,
+    EvidenceType,
+    Hypothesis,
+    HypothesisStatus,
+)
+from omnisleuth.evidence.store import EvidenceStore
 from omnisleuth.ingestion import CSVLoader
 from omnisleuth.ml.detectors import IQRAnomalyDetector, IsolationForestDetector
 from omnisleuth.persistence import DatabaseManager, Repository
+from omnisleuth.persistence.serializer import safe_json_loads
 from omnisleuth.profiling import DatasetProfiler
 
 st.set_page_config(
@@ -293,6 +303,12 @@ with st.sidebar:
         </div>""", unsafe_allow_html=True)
         st.markdown("<hr>", unsafe_allow_html=True)
         st.markdown('<div class="sidebar-section">System</div>', unsafe_allow_html=True)
+        settings = get_settings()
+        llm_configured = bool(settings.openai_api_key or settings.azure_openai_api_key)
+        llm_mode_label = f"Configured ({settings.llm_provider.title()})" if llm_configured else "Offline (Deterministic Only)"
+        llm_mode_color = "#22C55E" if llm_configured else "#F59E0B"
+        db_filename = Path(repo.db.db_path).name
+
         st.markdown(f"""
         <div style="padding:0.3rem 0;">
             <div style="font-size:0.68rem;color:#475569;margin-bottom:0.1rem;">Dataset ID</div>
@@ -300,11 +316,11 @@ with st.sidebar:
         </div>
         <div style="padding:0.3rem 0;">
             <div style="font-size:0.68rem;color:#475569;margin-bottom:0.1rem;">Storage</div>
-            <div class="sidebar-value">SQLite &middot; data/omnisleuth.db</div>
+            <div class="sidebar-value">SQLite &middot; {db_filename}</div>
         </div>
         <div style="padding:0.3rem 0;">
-            <div style="font-size:0.68rem;color:#475569;margin-bottom:0.1rem;">Status</div>
-            <div style="font-size:0.78rem;color:#22C55E;">Active</div>
+            <div style="font-size:0.68rem;color:#475569;margin-bottom:0.1rem;">LLM Mode</div>
+            <div style="font-size:0.78rem;color:{llm_mode_color};">{llm_mode_label}</div>
         </div>""", unsafe_allow_html=True)
     else:
         st.markdown('<div style="font-size:0.8rem;color:#475569;padding:0.5rem 0;">No dataset loaded.</div>',
@@ -384,27 +400,117 @@ with tabs[0]:
         if selected_example:
             user_question = selected_example
 
+    settings = get_settings()
+    llm_configured = bool(settings.openai_api_key or settings.azure_openai_api_key)
+    if not llm_configured:
+        st.info("ℹ️ **LLM not configured; showing deterministic results only.** Claims and findings are computed directly from raw data via allowlisted tools without generative text synthesis.")
+
     btn_col, _ = st.columns([1, 3])
     with btn_col:
         run_investigation = st.button("Investigate", type="primary", use_container_width=True)
+
+    # Investigation History Reopening Flow
+    past_investigations = repo.list_investigations(dataset_id=metadata.dataset_id)
+    if past_investigations:
+        with st.expander(f"Investigation History ({len(past_investigations)} saved)", expanded=False):
+            inv_options = {
+                f"{inv['created_at'][:19]} — {inv['question'][:60]} ({inv['investigation_id']})": inv["investigation_id"]
+                for inv in past_investigations
+            }
+            selected_label = st.selectbox(
+                "Select saved investigation to reopen",
+                list(inv_options.keys()),
+                key="history_select",
+            )
+            if st.button("Reopen Investigation", key="reopen_btn"):
+                selected_id = inv_options[selected_label]
+                reopened = repo.get_investigation(selected_id)
+                if reopened:
+                    reconstructed_store = EvidenceStore(
+                        dataset_id=reopened["dataset_id"],
+                        dataset_version=metadata.version_hash,
+                    )
+                    for ev_dict in reopened.get("evidence_items", []):
+                        content = ev_dict.get("content") or (
+                            safe_json_loads(ev_dict.get("content_json"), default={})
+                            if isinstance(ev_dict.get("content_json"), str)
+                            else {}
+                        )
+                        ev_item = EvidenceItem(
+                            evidence_id=ev_dict["evidence_id"],
+                            evidence_type=EvidenceType(ev_dict["evidence_type"]),
+                            source_id=ev_dict["source_id"],
+                            location=ev_dict.get("location"),
+                            content=content,
+                            confidence=ev_dict.get("confidence", 1.0),
+                            related_tool_execution_id=ev_dict.get("related_tool_execution_id"),
+                        )
+                        reconstructed_store.add_evidence(ev_item)
+
+                    for hyp_dict in reopened.get("hypotheses", []):
+                        hyp_item = Hypothesis(
+                            hypothesis_id=hyp_dict["hypothesis_id"],
+                            statement=hyp_dict["statement"],
+                            status=HypothesisStatus(hyp_dict["status"]),
+                            confidence=hyp_dict.get("confidence", 1.0),
+                            findings_summary=hyp_dict.get("findings_summary"),
+                        )
+                        reconstructed_store.add_hypothesis(hyp_item)
+
+                    for clm_dict in reopened.get("claims", []):
+                        clm_item = Claim(
+                            claim_id=clm_dict["claim_id"],
+                            statement=clm_dict["statement"],
+                            status=ClaimStatus(clm_dict["status"]),
+                            validation_notes=clm_dict.get("validation_notes"),
+                        )
+                        reconstructed_store.add_claim(clm_item)
+
+                    reopened_plan = reopened.get("plan") or {}
+                    reconstructed_tasks = (
+                        reopened_plan.get("tasks", [])
+                        if isinstance(reopened_plan, dict)
+                        else []
+                    )
+
+                    st.session_state.last_inv = {
+                        "question": reopened["question"],
+                        "dataset_metadata": metadata,
+                        "plan": reopened.get("plan"),
+                        "executed_tasks": reconstructed_tasks,
+                        "evidence_store": reconstructed_store,
+                        "hypotheses": reconstructed_store.list_hypotheses(),
+                        "claims": reconstructed_store.list_claims(),
+                        "validation_results": [],
+                        "final_answer": reopened.get("final_answer", ""),
+                        "status": reopened.get("status", "completed"),
+                    }
+                    st.rerun()
 
     if run_investigation:
         with st.spinner("Running multi-agent investigation\u2026"):
             inv_res = orchestrator.run_investigation(user_question, df, metadata)
             st.session_state.last_inv = inv_res
-            repo.save_investigation_results(
-                investigation_id=f"inv_{metadata.dataset_id[:6]}_{int(pd.Timestamp.now().timestamp())}",
-                dataset_id=metadata.dataset_id,
-                question=user_question,
-                status=inv_res["status"],
-                plan_dict=inv_res["plan"].model_dump(),
-                final_answer=inv_res["final_answer"],
-                evidence_store=inv_res["evidence_store"],
+            plan_dict = (
+                inv_res["plan"].model_dump()
+                if hasattr(inv_res.get("plan"), "model_dump")
+                else (inv_res.get("plan") or {})
             )
+            if inv_res.get("evidence_store") is not None:
+                repo.save_investigation_results(
+                    investigation_id=f"inv_{metadata.dataset_id[:6]}_{int(pd.Timestamp.now().timestamp())}",
+                    dataset_id=metadata.dataset_id,
+                    question=user_question,
+                    status=inv_res["status"],
+                    plan_dict=plan_dict,
+                    final_answer=inv_res["final_answer"],
+                    evidence_store=inv_res["evidence_store"],
+                )
+                st.rerun()
 
     if "last_inv" in st.session_state:
         inv_res = st.session_state.last_inv
-        store = inv_res["evidence_store"]
+        store = inv_res.get("evidence_store")
 
         st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
 
@@ -416,8 +522,8 @@ with tabs[0]:
             unsafe_allow_html=True)
 
         # KPIs
-        hypotheses = store.list_hypotheses()
-        evidence_items = store.list_evidence()
+        hypotheses = store.list_hypotheses() if store is not None else []
+        evidence_items = store.list_evidence() if store is not None else []
         validation_results = inv_res.get("validation_results", [])
         executed_tasks = inv_res.get("executed_tasks", [])
         hyp_supported = sum(1 for h in hypotheses if h.status == HypothesisStatus.SUPPORTED)
@@ -425,7 +531,7 @@ with tabs[0]:
 
         headline_pct = None
         for ev in evidence_items:
-            pct = ev.content.get("percentage_change")
+            pct = ev.content.get("overall_change_pct") or ev.content.get("percentage_change") or ev.content.get("total_change_pct")
             if pct is not None:
                 headline_pct = pct
                 break
@@ -578,13 +684,36 @@ with tabs[0]:
                         + (f'<div class="claim-explanation">{vr.validation_explanation}</div>' if vr.validation_explanation else "")
                         + '</div>',
                         unsafe_allow_html=True)
+            elif inv_res.get("claims"):
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.markdown('<div class="section-label">Validated Claims</div>', unsafe_allow_html=True)
+                for clm in inv_res.get("claims", []):
+                    status_val = clm.status.value if hasattr(clm.status, "value") else str(clm.status)
+                    if status_val == "supported":
+                        cls = "status-supported"
+                    elif status_val == "unsupported":
+                        cls = "status-rejected"
+                    else:
+                        cls = "status-inconclusive"
+                    st.markdown(
+                        f'<div class="claim-row">'
+                        f'<div style="margin-bottom:0.35rem;"><span class="status-tag {cls}">{status_val.title()}</span></div>'
+                        f'<div class="claim-text">{clm.statement}</div>'
+                        + (f'<div class="claim-explanation">{clm.validation_notes}</div>' if clm.validation_notes else "")
+                        + '</div>',
+                        unsafe_allow_html=True)
 
         with col_right:
             st.markdown('<div class="section-label">Execution Plan</div>', unsafe_allow_html=True)
             for task in executed_tasks:
-                agent = task.assigned_to.value.upper() if hasattr(task.assigned_to, "value") else str(task.assigned_to).upper()
-                tool = task.tool_name or "Analysis"
-                rationale = task.rationale or ""
+                if isinstance(task, dict):
+                    agent = str(task.get("assigned_to", "ANALYST")).upper()
+                    tool = task.get("tool_name") or "Analysis"
+                    rationale = task.get("rationale") or ""
+                else:
+                    agent = task.assigned_to.value.upper() if hasattr(task.assigned_to, "value") else str(task.assigned_to).upper()
+                    tool = task.tool_name or "Analysis"
+                    rationale = task.rationale or ""
                 st.markdown(
                     f'<div class="step-row">'
                     f'<div class="step-agent">{agent}</div>'
@@ -774,14 +903,17 @@ with tabs[3]:
         run_anom = st.button("Detect Anomalies", type="primary", use_container_width=True)
 
     if run_anom:
-        with st.spinner("Running anomaly detection\u2026"):
-            if "Isolation Forest" in method:
-                det = IsolationForestDetector(contamination=0.03)
-            else:
-                det = IQRAnomalyDetector(multiplier=1.5)
-            anom_res = det.detect(df, [target_num_col])
-            st.session_state.anom_res = anom_res
-            st.session_state.anom_col = target_num_col
+        with st.spinner("Running anomaly detection…"):
+            try:
+                if "Isolation Forest" in method:
+                    det = IsolationForestDetector(contamination=0.03)
+                else:
+                    det = IQRAnomalyDetector(multiplier=1.5)
+                anom_res = det.detect(df, [target_num_col])
+                st.session_state.anom_res = anom_res
+                st.session_state.anom_col = target_num_col
+            except Exception as exc:
+                st.warning(f"⚠️ Anomaly detection could not be completed: {exc}")
 
     if "anom_res" in st.session_state:
         anom_res = st.session_state.anom_res
@@ -874,14 +1006,15 @@ with tabs[4]:
     """, unsafe_allow_html=True)
 
     st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-    st.markdown('<div class="section-label">Registered Datasets</div>', unsafe_allow_html=True)
-    datasets = repo.list_datasets()
-    if datasets:
-        st.dataframe(pd.DataFrame(datasets), use_container_width=True, hide_index=True)
+    past_invs = repo.list_investigations(dataset_id=metadata.dataset_id)
+    if past_invs:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="section-label">Saved Investigations History</div>', unsafe_allow_html=True)
+        st.dataframe(pd.DataFrame(past_invs), use_container_width=True, hide_index=True)
 
     if "last_inv" in st.session_state:
-        store = st.session_state.last_inv["evidence_store"]
-        ev_list = store.list_evidence()
+        store = st.session_state.last_inv.get("evidence_store")
+        ev_list = store.list_evidence() if store is not None else []
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown(f'<div class="section-label">Investigation Evidence Store ({len(ev_list)} items)</div>',
                     unsafe_allow_html=True)
@@ -907,14 +1040,23 @@ with tabs[5]:
     st.markdown('<div class="section-label">Benchmark Evaluation</div>', unsafe_allow_html=True)
     st.markdown('<div class="section-title">System Evaluation Harness</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-desc">Structured benchmark measuring numerical correctness, tool selection, '
-        'evidence coverage, unsupported claim rate, and latency. Compared against fixed baselines.</div>',
+        '<div class="section-desc">Empirical benchmark measuring 13 performance metrics across OmniSleuth and candidate baselines '
+        '(Baseline 1: Direct Tools, Baseline 2: Fixed Pipeline). All values measured from actual execution.</div>',
         unsafe_allow_html=True)
 
-    if st.button("Run Benchmark Evaluation", type="primary"):
-        with st.spinner("Evaluating against benchmark question suite\u2026"):
-            bench_res = evaluator.evaluate_omnisleuth(df, metadata, questions=BENCHMARK_QUESTIONS)
-            st.session_state.bench_res = bench_res
+    col_btn1, col_btn2 = st.columns([1, 1])
+    with col_btn1:
+        if st.button("Run Full Comparative Benchmark (All 3 Systems)", type="primary"):
+            with st.spinner("Executing full Phase 18 benchmark across 40 questions & baselines…"):
+                exp_rec = evaluator.run_full_benchmark(df, metadata, questions=BENCHMARK_QUESTIONS)
+                st.session_state.exp_rec = exp_rec
+                st.session_state.bench_res = exp_rec.systems["omnisleuth"]
+
+    with col_btn2:
+        if st.button("Run OmniSleuth Evaluation Only"):
+            with st.spinner("Evaluating OmniSleuth architecture…"):
+                bench_res = evaluator.evaluate_omnisleuth(df, metadata, questions=BENCHMARK_QUESTIONS)
+                st.session_state.bench_res = bench_res
 
     if "bench_res" in st.session_state:
         bench_res = st.session_state.bench_res
@@ -945,41 +1087,59 @@ with tabs[5]:
                 f'<div class="kpi-value" style="color:{c};">{bench_res.unsupported_claim_rate_pct:.1f}%</div></div>',
                 unsafe_allow_html=True)
 
-        l1, l2, _ = st.columns([1, 1, 2])
-        with l1:
+        st.markdown("<br>", unsafe_allow_html=True)
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
             st.markdown(
-                f'<div class="kpi-block" style="margin-top:0.6rem;"><div class="kpi-label">Latency p50</div>'
-                f'<div class="kpi-value kpi-value-neutral">{bench_res.latency_p50_ms:.0f} ms</div></div>',
+                f'<div class="kpi-block"><div class="kpi-label">Completeness</div>'
+                f'<div class="kpi-value kpi-value-neutral">{bench_res.investigation_completeness_pct:.1f}%</div></div>',
                 unsafe_allow_html=True)
-        with l2:
+        with m2:
             st.markdown(
-                f'<div class="kpi-block" style="margin-top:0.6rem;"><div class="kpi-label">Latency p95</div>'
-                f'<div class="kpi-value kpi-value-neutral">{bench_res.latency_p95_ms:.0f} ms</div></div>',
+                f'<div class="kpi-block"><div class="kpi-label">Anomaly F1</div>'
+                f'<div class="kpi-value kpi-value-neutral">{bench_res.anomaly_f1:.2f}</div></div>',
+                unsafe_allow_html=True)
+        with m3:
+            st.markdown(
+                f'<div class="kpi-block"><div class="kpi-label">RAG Recall@5</div>'
+                f'<div class="kpi-value kpi-value-neutral">{bench_res.retrieval_recall_at_5:.2f}</div></div>',
+                unsafe_allow_html=True)
+        with m4:
+            st.markdown(
+                f'<div class="kpi-block"><div class="kpi-label">Latency p50 / p95</div>'
+                f'<div class="kpi-value kpi-value-neutral" style="font-size:1.1rem;">{bench_res.latency_p50_ms:.0f} / {bench_res.latency_p95_ms:.0f} ms</div></div>',
                 unsafe_allow_html=True)
 
+        # Comparison table
         st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-        st.markdown('<div class="section-label">Comparison Against Baselines</div>', unsafe_allow_html=True)
-        comp_table = pd.DataFrame([
-            {
-                "Architecture": "Baseline 1 \u2014 Direct LLM (unbounded)",
-                "Numerical Correctness": "42.0%",
-                "Evidence Coverage": "0.0%",
-                "Unsupported Claims": "58.0%",
-                "Latency (p50)": "~1,800 ms",
-            },
-            {
-                "Architecture": "Baseline 2 \u2014 Fixed tool script",
-                "Numerical Correctness": "92.0%",
-                "Evidence Coverage": "60.0%",
-                "Unsupported Claims": "15.0%",
-                "Latency (p50)": "~80 ms",
-            },
-            {
-                "Architecture": "OmniSleuth \u2014 Agent + Tools + RAG + Validator",
-                "Numerical Correctness": f"{bench_res.numerical_correctness_pct:.1f}%",
-                "Evidence Coverage": f"{bench_res.evidence_coverage_pct:.1f}%",
-                "Unsupported Claims": f"{bench_res.unsupported_claim_rate_pct:.1f}%",
-                "Latency (p50)": f"~{bench_res.latency_p50_ms:.0f} ms",
-            },
-        ])
-        st.dataframe(comp_table, use_container_width=True, hide_index=True)
+        st.markdown('<div class="section-label">Empirical Comparison Across Architectures</div>', unsafe_allow_html=True)
+
+        if "exp_rec" in st.session_state:
+            exp_rec = st.session_state.exp_rec
+            rows = []
+            for sys_key, sys_res in exp_rec.systems.items():
+                rows.append({
+                    "Architecture": sys_res.system_name,
+                    "Numerical Correctness": f"{sys_res.numerical_correctness_pct:.1f}%",
+                    "Tool Accuracy": f"{sys_res.tool_selection_accuracy_pct:.1f}%",
+                    "Evidence Coverage": f"{sys_res.evidence_coverage_pct:.1f}%",
+                    "Unsupported Claims": f"{sys_res.unsupported_claim_rate_pct:.1f}%",
+                    "Completeness": f"{sys_res.investigation_completeness_pct:.1f}%",
+                    "Faithfulness": f"{sys_res.faithfulness_pct:.1f}%",
+                    "Latency (p50)": f"{sys_res.latency_p50_ms:.0f} ms",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            comp_table = pd.DataFrame([
+                {
+                    "Architecture": "OmniSleuth (Agent + Tools + RAG + Validator)",
+                    "Numerical Correctness": f"{bench_res.numerical_correctness_pct:.1f}%",
+                    "Tool Selection": f"{bench_res.tool_selection_accuracy_pct:.1f}%",
+                    "Evidence Coverage": f"{bench_res.evidence_coverage_pct:.1f}%",
+                    "Unsupported Claims": f"{bench_res.unsupported_claim_rate_pct:.1f}%",
+                    "Completeness": f"{bench_res.investigation_completeness_pct:.1f}%",
+                    "Latency (p50)": f"{bench_res.latency_p50_ms:.0f} ms",
+                }
+            ])
+            st.dataframe(comp_table, use_container_width=True, hide_index=True)
+            st.info("Run 'Full Comparative Benchmark' to populate real empirical metrics for Baseline 1 and Baseline 2.")

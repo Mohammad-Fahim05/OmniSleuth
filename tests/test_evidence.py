@@ -97,3 +97,53 @@ def test_investigation_tree_nodes(store_fixture):
     store.add_node(child)
 
     assert child.node_id in store.nodes[root.node_id].children_ids
+
+
+def test_list_hypotheses_and_claims_query_api(store_fixture):
+    """Regression test ensuring list_hypotheses and list_claims work seamlessly in UI and persistence."""
+    _, _, store, _ = store_fixture
+
+    # Initially empty
+    assert store.list_hypotheses() == []
+    assert store.list_claims() == []
+    assert store.list_nodes() == []
+
+    # Add multiple hypotheses with distinct statuses
+    h1 = Hypothesis(
+        statement="Hypothesis 1: Trend drop in Electronics",
+        status=HypothesisStatus.SUPPORTED,
+    )
+    h2 = Hypothesis(
+        statement="Hypothesis 2: Region shift in South",
+        status=HypothesisStatus.REJECTED,
+    )
+    h3 = Hypothesis(
+        statement="Hypothesis 3: Price increase anomaly",
+        status=HypothesisStatus.INCONCLUSIVE,
+    )
+    store.add_hypothesis(h1)
+    store.add_hypothesis(h2)
+    store.add_hypothesis(h3)
+
+    # Test listing all and filtering
+    all_hyps = store.list_hypotheses()
+    assert len(all_hyps) == 3
+    assert store.list_hypotheses(status=HypothesisStatus.SUPPORTED) == [h1]
+    assert store.list_hypotheses(status=HypothesisStatus.REJECTED) == [h2]
+    assert store.list_hypotheses(status=HypothesisStatus.INCONCLUSIVE) == [h3]
+
+    # Add claims and test listing
+    c1 = Claim(statement="Claim 1", status=ClaimStatus.SUPPORTED)
+    c2 = Claim(statement="Claim 2", status=ClaimStatus.UNSUPPORTED)
+    store.add_claim(c1)
+    store.add_claim(c2)
+
+    assert len(store.list_claims()) == 2
+    assert store.list_claims(status=ClaimStatus.SUPPORTED) == [c1]
+    assert store.get_claim(c1.claim_id) == c1
+
+    # Add node and test listing
+    n1 = InvestigationNode(node_type="finding", title="Root node")
+    store.add_node(n1)
+    assert len(store.list_nodes()) == 1
+    assert store.get_node(n1.node_id) == n1

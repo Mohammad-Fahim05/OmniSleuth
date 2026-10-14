@@ -8,7 +8,9 @@ from omnisleuth.evaluation.dataset_generator import (
     generate_benchmark_sales_dataset,
 )
 from omnisleuth.evaluation.evaluator import (
+    ExperimentRecord,
     OmniSleuthEvaluator,
+    PerQuestionResult,
     SystemBenchmarkResult,
 )
 
@@ -18,4 +20,6 @@ __all__ = [
     "BENCHMARK_QUESTIONS",
     "OmniSleuthEvaluator",
     "SystemBenchmarkResult",
+    "PerQuestionResult",
+    "ExperimentRecord",
 ]

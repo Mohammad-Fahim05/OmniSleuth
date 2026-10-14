@@ -61,6 +61,20 @@ class Repository:
             cursor = conn.execute("SELECT * FROM datasets ORDER BY created_at DESC")
             return [dict(row) for row in cursor.fetchall()]
 
+    def list_investigations(self, dataset_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieve all registered investigations, optionally filtered by dataset."""
+        with self.db.get_connection() as conn:
+            if dataset_id:
+                cur = conn.execute(
+                    "SELECT investigation_id, dataset_id, question, status, created_at FROM investigations WHERE dataset_id = ? ORDER BY created_at DESC",
+                    (dataset_id,),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT investigation_id, dataset_id, question, status, created_at FROM investigations ORDER BY created_at DESC"
+                )
+            return [dict(row) for row in cur.fetchall()]
+
     def save_investigation_results(
         self,
         investigation_id: str,
@@ -181,7 +195,12 @@ class Repository:
 
             # Evidence items
             cur_ev = conn.execute("SELECT * FROM evidence_items WHERE investigation_id = ?", (investigation_id,))
-            res["evidence_items"] = [dict(r) for r in cur_ev.fetchall()]
+            ev_list = []
+            for r in cur_ev.fetchall():
+                ev_d = dict(r)
+                ev_d["content"] = safe_json_loads(ev_d.get("content_json"), default={})
+                ev_list.append(ev_d)
+            res["evidence_items"] = ev_list
 
             # Hypotheses
             cur_hyp = conn.execute("SELECT * FROM hypotheses WHERE investigation_id = ?", (investigation_id,))

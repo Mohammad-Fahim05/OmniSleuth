@@ -11,9 +11,11 @@ from omnisleuth.analytics.models import (
 from omnisleuth.core.logging import get_logger
 from omnisleuth.evidence.models import (
     Claim,
+    ClaimStatus,
     EvidenceItem,
     EvidenceType,
     Hypothesis,
+    HypothesisStatus,
     InvestigationNode,
     ToolExecution,
 )
@@ -185,11 +187,30 @@ class EvidenceStore:
         self.hypotheses[hyp.hypothesis_id] = hyp
 
     def get_hypothesis(self, hypothesis_id: str) -> Optional[Hypothesis]:
+        """Retrieve hypothesis by ID."""
         return self.hypotheses.get(hypothesis_id)
+
+    def list_hypotheses(self, status: Optional[HypothesisStatus] = None) -> List[Hypothesis]:
+        """List all hypotheses, optionally filtered by status."""
+        items = list(self.hypotheses.values())
+        if status:
+            items = [item for item in items if item.status == status]
+        return items
 
     def add_claim(self, claim: Claim) -> None:
         """Add a factual/numerical claim."""
         self.claims[claim.claim_id] = claim
+
+    def get_claim(self, claim_id: str) -> Optional[Claim]:
+        """Retrieve claim by ID."""
+        return self.claims.get(claim_id)
+
+    def list_claims(self, status: Optional[ClaimStatus] = None) -> List[Claim]:
+        """List all claims, optionally filtered by status."""
+        items = list(self.claims.values())
+        if status:
+            items = [item for item in items if item.status == status]
+        return items
 
     def add_node(self, node: InvestigationNode) -> None:
         """Add a tree node and link to parent if specified."""
@@ -198,3 +219,11 @@ class EvidenceStore:
             parent = self.nodes[node.parent_id]
             if node.node_id not in parent.children_ids:
                 parent.children_ids.append(node.node_id)
+
+    def get_node(self, node_id: str) -> Optional[InvestigationNode]:
+        """Retrieve tree node by ID."""
+        return self.nodes.get(node_id)
+
+    def list_nodes(self) -> List[InvestigationNode]:
+        """List all investigation tree nodes."""
+        return list(self.nodes.values())

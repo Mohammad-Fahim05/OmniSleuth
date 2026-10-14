@@ -27,6 +27,9 @@ class IQRAnomalyDetector:
         """Flag rows exceeding Q3 + k*IQR or below Q1 - k*IQR for given numeric columns."""
         start_time = time.perf_counter()
 
+        if len(df) < 5:
+            raise ToolExecutionError(f"Insufficient data rows ({len(df)}) for anomaly detection (minimum 5 rows required).")
+
         missing_cols = [c for c in feature_columns if c not in df.columns]
         if missing_cols:
             raise ToolExecutionError(f"Columns not found for IQR detection: {missing_cols}")

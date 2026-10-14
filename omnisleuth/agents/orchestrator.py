@@ -19,6 +19,9 @@ from omnisleuth.tools import ToolRegistry, get_default_tool_registry
 logger = get_logger("agents.orchestrator")
 
 
+from omnisleuth.llm import LLMGateway
+
+
 class MultiAgentOrchestrator:
     """Coordinates specialized agents over typed shared state and evidence store with guardrails."""
 
@@ -26,12 +29,14 @@ class MultiAgentOrchestrator:
         self,
         tool_registry: Optional[ToolRegistry] = None,
         document_store: Optional[DocumentStore] = None,
+        llm_gateway: Optional[LLMGateway] = None,
     ):
         self.registry = tool_registry or get_default_tool_registry()
         self.doc_store = document_store or DocumentStore()
+        self.llm_gateway = llm_gateway or LLMGateway()
 
         self.input_guard = InputGuardrailEngine()
-        self.supervisor = SupervisorAgent()
+        self.supervisor = SupervisorAgent(llm_gateway=self.llm_gateway)
         self.analyst = DataAnalystAgent(registry=self.registry)
         self.retriever = RetrievalAgent(document_store=self.doc_store)
         self.investigator = InvestigationAgent()
@@ -125,6 +130,8 @@ class MultiAgentOrchestrator:
 
         # 5. Step 5: Programmatic claim validation
         validation_results = self.validator.validate_all(claims, evidence_store)
+        for c in claims:
+            evidence_store.add_claim(c)
 
         # 6. Step 6: Generate structured synthesis answer
         raw_final_answer = self._synthesize_answer(question, metadata, evidence_store, validation_results)

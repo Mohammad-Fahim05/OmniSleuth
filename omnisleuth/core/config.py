@@ -39,6 +39,28 @@ class Settings(BaseSettings):
     openai_model: str = Field(default="gpt-4o-mini", description="Default OpenAI chat model")
     embedding_model: str = Field(default="text-embedding-3-small", description="Default embeddings model")
 
+    # Phase 19 LLM Gateway Settings
+    llm_provider: str = Field(default="fallback", description="LLM provider: 'openai', 'azure', or 'fallback'")
+    llm_model: str = Field(default="gpt-4o-mini", description="Primary LLM model name")
+    llm_timeout_seconds: float = Field(default=30.0, description="LLM request timeout in seconds")
+    llm_max_retries: int = Field(default=3, description="Maximum retries for transient LLM errors")
+    llm_retry_base_delay: float = Field(default=1.0, description="Base exponential backoff delay in seconds")
+    llm_retry_max_delay: float = Field(default=10.0, description="Maximum exponential backoff delay in seconds")
+
+    # Azure OpenAI (Optional)
+    azure_openai_api_key: Optional[str] = Field(default=None, description="Azure OpenAI API key")
+    azure_openai_endpoint: Optional[str] = Field(default=None, description="Azure OpenAI endpoint URL")
+    azure_openai_deployment: Optional[str] = Field(default=None, description="Azure OpenAI deployment name")
+    azure_openai_api_version: str = Field(default="2024-02-15-preview", description="Azure OpenAI API version")
+
+    # Pricing & Metering
+    llm_input_price_per_1k: Optional[float] = Field(default=0.00015, description="Input price per 1,000 tokens in USD")
+    llm_output_price_per_1k: Optional[float] = Field(default=0.00060, description="Output price per 1,000 tokens in USD")
+
+    # Semantic Cache
+    llm_cache_enabled: bool = Field(default=False, description="Enable optional semantic cache")
+    llm_cache_similarity_threshold: float = Field(default=0.95, description="Similarity threshold for semantic cache hits")
+
     # Local Hybrid RAG Settings (Phase 10)
     local_embedding_model: str = Field(default="sentence-transformers/all-MiniLM-L6-v2", description="Local dense embedding model")
     local_reranker_model: str = Field(default="cross-encoder/ms-marco-TinyBERT-L-2-v2", description="Local cross-encoder reranker model")

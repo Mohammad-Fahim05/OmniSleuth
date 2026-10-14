@@ -11,11 +11,15 @@ from omnisleuth.ingestion.models import DatasetMetadata
 logger = get_logger("agents.supervisor")
 
 
+from omnisleuth.llm import LLMGateway, LLMRequest
+
+
 class SupervisorAgent:
     """Orchestrates structured investigation planning and task delegation."""
 
-    def __init__(self):
+    def __init__(self, llm_gateway: Optional[LLMGateway] = None):
         self.settings = get_settings()
+        self.llm_gateway = llm_gateway or LLMGateway()
 
     def create_investigation_plan(
         self,
