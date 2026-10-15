@@ -84,3 +84,29 @@ This document records the foundational architectural decisions (ADRs) that gover
   - Dynamically binds to `$PORT` environment variable.
   - Implements container-level `HEALTHCHECK` against `/_stcore/health`.
 - **Rationale**: Mitigates privilege escalation attacks and satisfies enterprise container security scanners.
+
+---
+
+## ADR-09: OpenRouter as an OpenAI-Compatible Optional LLM Provider (Phase C1)
+
+- **Context**: Phase C1 needs an LLM that can map arbitrary natural language questions to a structured analysis plan. Introducing a bespoke OpenRouter client would duplicate the provider, retry, usage-metering, tracing, and caching layers already built for OpenAI and Azure.
+- **Decision**:
+  - `OpenRouterProvider` reuses the existing `openai` SDK with only `base_url` changed, following the existing `BaseProvider` pattern. No new dependency is introduced.
+  - OpenRouter is selected purely through configuration: `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`). The model is never hard-coded in planner logic, and no model is assumed free or available.
+  - When OpenRouter is selected without a key, the provider raises a permanent `ConfigurationError` **before** any network call, and the gateway activates the existing deterministic offline fallback.
+- **Rationale**: Keeps one provider abstraction, one retry policy, one cache, and one trace pipeline; makes OpenRouter an optional add-on that cannot break offline operation.
+
+---
+
+## ADR-10: LLM Plans Are Types, Not Text — Planning Stays Separated From Execution (Phase C1)
+
+- **Context**: An LLM-backed planner introduces two risks: arbitrary code execution (Rule 1/2) and an LLM performing arithmetic on data it never correctly observed. A third, subtler risk is that a deterministic fallback response could be mistaken for a genuine model plan.
+- **Decision**:
+  - `LLMPlanner` produces a **structured `AnalysisPlan` only**. It receives a `SchemaContext` (never a DataFrame), so it structurally cannot read raw rows or compute results; all numbers come from `PlanExecutor` and the deterministic analytics engine.
+  - The prompt contains only a bounded, sanitized profile (column names/types, numeric bounds, date ranges, cardinality, and at most 10 distinct values for low-cardinality columns) plus the allowlisted vocabulary and the plan JSON schema. Raw rows and high-cardinality cell values are excluded by construction, with further prompt budgets (profile, question, total prompt, reply tokens).
+  - Output handling is defensive: optional Markdown fences are stripped, the JSON object is sliced out, the payload is checked for executable content, and the plan is constructed by `AnalysisPlan` with `extra="forbid"` (no such field exists to carry code, SQL, or shell commands).
+  - Every plan then passes through the **same** `PlanValidator` used by the rule-based planner. One bounded repair attempt is allowed, using only sanitized validation errors; a still-invalid plan raises `LLMPlanningError`.
+  - Planner identity is recorded as `planner="llm"` on the plan; `LLMPlanner.plan_with_fallback()` delegates to `RulePlanner`, which reports `planner="deterministic"` so a deterministic plan is never presented as an LLM one.
+  - `LLMGateway.is_fallback_response()` explicitly identifies offline fallback / error responses, and the planner refuses to parse them as a model plan.
+  - Error messages and traces are sanitized through `omnisleuth/llm/errors.py`: API keys, Authorization headers, and other secrets are redacted before logging or raising, and failures are returned as actionable categories (`rate_limit`, `server_error`, `network_error`, `timeout`, `authentication_error`, `invalid_request_error`, `configuration_error`).
+- **Rationale**: The LLM only chooses *what* to analyze; deterministic code always decides *what the answer is*. Security depends on validation, not on prompt compliance.
