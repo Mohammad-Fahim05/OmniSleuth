@@ -38,7 +38,6 @@ CREATE TABLE IF NOT EXISTS investigations (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (dataset_id) REFERENCES datasets (dataset_id)
 );
-
 CREATE TABLE IF NOT EXISTS tool_executions (
     execution_id TEXT PRIMARY KEY,
     investigation_id TEXT,
@@ -87,6 +86,15 @@ CREATE TABLE IF NOT EXISTS claims (
 class DatabaseManager:
     """Manages SQLite connections and schema migrations."""
 
+    # Additive columns only: reopening an investigation records the bounded result
+    # table and chart spec alongside the existing plan JSON.
+    ADDITIVE_COLUMNS = (
+        ("investigations", "result_table_json", "TEXT"),
+        ("investigations", "chart_spec_json", "TEXT"),
+        ("investigations", "planner_used", "TEXT"),
+        ("investigations", "summary_text", "TEXT"),
+    )
+
     def __init__(self, db_path: Optional[str] = None):
         settings = get_settings()
         self.db_path = Path(db_path or settings.sqlite_db_path)
@@ -101,8 +109,22 @@ class DatabaseManager:
         return conn
 
     def initialize_schema(self) -> None:
-        """Create database tables if they do not already exist."""
+        """Create database tables if they do not already exist, then apply additive migrations."""
         with self.get_connection() as conn:
             conn.executescript(SCHEMA_SQL)
+            self._apply_additive_migrations(conn)
             conn.commit()
         logger.info(f"Initialized SQLite database at: {self.db_path}")
+
+    @classmethod
+    def _apply_additive_migrations(cls, conn: sqlite3.Connection) -> None:
+        """Add missing columns without dropping or rewriting existing data."""
+        for table, column, column_type in cls.ADDITIVE_COLUMNS:
+            existing = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if column not in existing:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
+                )
+                logger.info(f"Added column {table}.{column} ({column_type})")

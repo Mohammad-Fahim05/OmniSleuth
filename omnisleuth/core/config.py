@@ -71,6 +71,10 @@ class Settings(BaseSettings):
         default="rule",
         description="Fallback policy when LLM planning fails: 'rule' (deterministic) or 'fail'",
     )
+    nlq_narration_enabled: bool = Field(
+        default=False,
+        description="Optional LLM rewriting of templated answers (numbers must stay evidence-grounded)",
+    )
 
     # Semantic Cache
     llm_cache_enabled: bool = Field(default=False, description="Enable optional semantic cache")

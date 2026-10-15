@@ -84,15 +84,24 @@ class Repository:
         plan_dict: Dict[str, Any],
         final_answer: str,
         evidence_store: EvidenceStore,
+        result_table: Optional[List[Dict[str, Any]]] = None,
+        chart_spec: Optional[Dict[str, Any]] = None,
+        planner_used: Optional[str] = None,
+        summary_text: Optional[str] = None,
     ) -> None:
-        """Atomically persist investigation run, executions, evidence, hypotheses, and claims."""
+        """Atomically persist investigation run, executions, evidence, hypotheses, and claims.
+
+        ``result_table``, ``chart_spec``, ``planner_used`` and ``summary_text`` are
+        optional and purely additive so existing callers keep working.
+        """
         with self.db.get_connection() as conn:
             # 1. Investigations table
             conn.execute(
                 """
                 INSERT OR REPLACE INTO investigations
-                (investigation_id, dataset_id, question, status, plan_json, final_answer)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (investigation_id, dataset_id, question, status, plan_json, final_answer,
+                 result_table_json, chart_spec_json, planner_used, summary_text)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     investigation_id,
@@ -101,6 +110,10 @@ class Repository:
                     status,
                     safe_json_dumps(plan_dict),
                     final_answer,
+                    safe_json_dumps(result_table) if result_table else None,
+                    safe_json_dumps(chart_spec) if chart_spec else None,
+                    planner_used,
+                    summary_text,
                 ),
             )
 
@@ -192,6 +205,8 @@ class Repository:
 
             res = dict(inv_row)
             res["plan"] = safe_json_loads(res.get("plan_json"), default={})
+            res["result_table"] = safe_json_loads(res.get("result_table_json"), default=None)
+            res["chart_spec"] = safe_json_loads(res.get("chart_spec_json"), default=None)
 
             # Evidence items
             cur_ev = conn.execute("SELECT * FROM evidence_items WHERE investigation_id = ?", (investigation_id,))

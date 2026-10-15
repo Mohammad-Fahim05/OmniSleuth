@@ -38,10 +38,12 @@ logger = get_logger("nlq.executor")
 class PlanExecutor:
     """Executes validated AnalysisPlans deterministically via pandas and allowlisted tools."""
 
-    def __init__(self, repository: Optional[Repository] = None):
+    def __init__(self, repository: Optional[Repository] = None, orchestrator: Optional[Any] = None):
         self.repo = repository or Repository()
         self.claim_validator = ClaimValidator(numerical_tolerance_pct=1.0)
-        self.orchestrator = MultiAgentOrchestrator()
+        # Injectable so callers can share one orchestrator instance instead of
+        # building a second (expensive) agent stack per executor.
+        self.orchestrator = orchestrator or MultiAgentOrchestrator()
 
     def execute(
         self,
@@ -144,8 +146,12 @@ class PlanExecutor:
         claims = inv_res.get("claims", [])
         final_answer = inv_res["final_answer"]
 
-        # Persist results
+        # Persist results (the dataset row must exist first for the FK constraint)
         inv_id = f"inv_{metadata.dataset_id[:6]}_{uuid.uuid4().hex[:8]}"
+        try:
+            self.repo.save_dataset(metadata)
+        except Exception as exc:
+            logger.warning(f"Could not persist dataset metadata for deep investigation: {exc}")
         self.repo.save_investigation_results(
             investigation_id=inv_id,
             dataset_id=metadata.dataset_id,
@@ -154,6 +160,8 @@ class PlanExecutor:
             plan_dict=plan.model_dump(),
             final_answer=final_answer,
             evidence_store=store,
+            planner_used=plan.planner,
+            summary_text="Multi-agent diagnostic investigation with automated hypothesis testing.",
         )
 
         return QueryResult(

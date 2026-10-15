@@ -413,10 +413,9 @@ def test_ui_reports_mode_and_fallback_status(dataset, tmp_path, monkeypatch, cle
     assert len(at.exception) == 0
     _load_sample(at)
 
-    # Deterministic mode: no fallback note.
-    # text_input[0] is the Investigation tab; text_input[1] is the Ask Data tab.
-    at.text_input[1].input("What is total revenue by category?")
-    [b for b in at.button if b.label == "Get Answer"][0].click().run()
+    # Deterministic mode is the default and reports no fallback.
+    at.text_input[0].input("What is total revenue by category?")
+    [b for b in at.button if b.label == "Investigate"][0].click().run()
     assert len(at.exception) == 0
 
     routing = at.session_state.get("nlq_routing")
@@ -475,8 +474,8 @@ def test_ui_llm_mode_without_credentials_reports_fallback(tmp_path, monkeypatch,
     infos = " ".join(i.value for i in at.info)
     assert "LLM planner selected but no provider is configured" in infos
 
-    at.text_input[1].input("What is total revenue by category?")
-    [b for b in at.button if b.label == "Get Answer"][0].click().run()
+    at.text_input[0].input("What is total revenue by category?")
+    [b for b in at.button if b.label == "Investigate"][0].click().run()
     assert len(at.exception) == 0
 
     routing = at.session_state.get("nlq_routing")

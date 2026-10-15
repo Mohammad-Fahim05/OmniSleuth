@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import pandas as pd
 
 from omnisleuth.nlq.context import ColumnContext, SchemaContext
+from omnisleuth.nlq.followup import detect_followup_marker, resolve_rule_followup
 from omnisleuth.nlq.models import (
     AnalysisPlan,
     ChartSpec,
@@ -54,6 +55,13 @@ class RulePlanner:
         history_ctx: Optional[List[Dict[str, Any]]] = None,
     ) -> AnalysisPlan:
         """Produce an AnalysisPlan from question and schema context."""
+        # 0. Follow-up resolution: a short question that extends an earlier turn
+        # ("And for 2023?", "now by region") inherits its metric and dimensions.
+        if history_ctx or detect_followup_marker(question) is not None:
+            followup_plan = resolve_rule_followup(question, list(history_ctx or []), schema_ctx)
+            if followup_plan is not None:
+                return followup_plan
+
         # 1. Sanitize untrusted question input
         sanitized_q = self._sanitize_question(question)
         if not sanitized_q:

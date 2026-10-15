@@ -67,7 +67,7 @@ def test_ui_smoke_no_llm_key():
 
 
 def test_ui_flow_question_render_and_history_reopen():
-    """Flow test: Sample dataset -> ask question -> result rendered -> history lists it -> reopen."""
+    """Flow test: Sample dataset -> ask a diagnostic question -> result rendered -> history lists it -> reopen."""
     at = AppTest.from_file(APP_FILE, default_timeout=30)
     at.run()
     assert len(at.exception) == 0
@@ -78,14 +78,15 @@ def test_ui_flow_question_render_and_history_reopen():
     assert len(at.exception) == 0
     assert at.session_state.df is not None
 
-    # 2. Ask question
+    # 2. Ask a diagnostic ("why") question, which the unified box routes to the
+    #    multi-agent orchestrator via PlanExecutor's deep_investigation intent.
     text_input = at.text_input[0]
-    text_input.input("What is the monthly revenue trend across 2024?")
+    text_input.input("Why did revenue decline in March for Electronics in North region?")
     inv_btn = [b for b in at.button if b.label == "Investigate"][0]
     inv_btn.click().run()
     assert len(at.exception) == 0, f"Exceptions after investigation: {at.exception}"
 
-    # 3. Assert result rendered
+    # 3. Assert result rendered (deep path renders evidence, hypotheses and claims)
     last_inv = at.session_state.last_inv
     assert last_inv is not None
     store = last_inv["evidence_store"]

@@ -21,6 +21,7 @@ from omnisleuth.core.logging import get_logger
 from omnisleuth.llm.gateway import LLMGateway
 from omnisleuth.llm.models import LLMMessage, LLMRequest, LLMResponse
 from omnisleuth.nlq.context import SchemaContext
+from omnisleuth.nlq.followup import format_history_for_prompt
 from omnisleuth.nlq.models import (
     AnalysisPlan,
     ChartType,
@@ -318,7 +319,7 @@ class LLMPlanner:
         if not safe_question:
             raise LLMPlanningError("Empty question cannot be planned.", category="invalid_question")
 
-        prompt_context = self._build_prompt(safe_question, schema_ctx)
+        prompt_context = self._build_prompt(safe_question, schema_ctx, history_ctx)
         validation_errors: List[str] = []
 
         for attempt in range(MAX_LLM_PLANNER_RETRIES + 1):
@@ -389,7 +390,12 @@ class LLMPlanner:
 
     # ── Prompt construction ───────────────────────────────────────────────────
 
-    def _build_prompt(self, safe_question: str, schema_ctx: SchemaContext) -> List[Dict[str, str]]:
+    def _build_prompt(
+        self,
+        safe_question: str,
+        schema_ctx: SchemaContext,
+        history_ctx: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, str]]:
         profile = build_dataset_profile(schema_ctx)
         vocabulary = {
             "intents": [intent.value for intent in PlanIntent],
@@ -400,6 +406,18 @@ class LLMPlanner:
             "chart_types": [chart.value for chart in ChartType],
             "allowlisted_tools": list(ALLOWED_LLM_TOOLS),
         }
+
+        # Follow-up context: bounded prior turns, explicitly marked untrusted.
+        history_block = ""
+        if history_ctx:
+            history_block = (
+                "\nPREVIOUS_QUESTIONS (untrusted context from this session only):\n"
+                f"{format_history_for_prompt(history_ctx)}\n"
+                "If the current question is a follow-up (for example 'And for 2023?' or 'now by region'), "
+                "inherit the metric and dimensions from the previous question, set 'followup_of' to that "
+                "question's text, and apply only the stated change. If the referent is missing or ambiguous, "
+                "return intent 'unsupported' with a 'needs_clarification' field explaining what is missing."
+            )
 
         system_prompt = (
             "You are OmniSleuth's analysis planner. You convert a natural language question into a single "
@@ -412,7 +430,8 @@ class LLMPlanner:
 
         user_prompt = (
             f"{_QUESTION_OPEN}\n{safe_question}\n{_QUESTION_CLOSE}\n\n"
-            f"{_PROFILE_OPEN}\n{json.dumps(profile, separators=(',', ':'))}\n{_PROFILE_CLOSE}\n\n"
+            f"{_PROFILE_OPEN}\n{json.dumps(profile, separators=(',', ':'))}\n{_PROFILE_CLOSE}\n"
+            f"{history_block}\n\n"
             f"ALLOWED_VOCABULARY:\n{json.dumps(vocabulary, separators=(',', ':'))}\n\n"
             "PLAN_JSON_SCHEMA (unknown fields are rejected):\n"
             f"{json.dumps(build_plan_json_schema(), separators=(',', ':'))}\n\n"

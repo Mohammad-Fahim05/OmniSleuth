@@ -23,11 +23,55 @@ from omnisleuth.evidence.models import (
 from omnisleuth.evidence.store import EvidenceStore
 from omnisleuth.ingestion import CSVLoader
 from omnisleuth.ml.detectors import IQRAnomalyDetector, IsolationForestDetector
+from omnisleuth.nlq.charting import infer_example_questions
+from omnisleuth.nlq.context import build_schema_context
+from omnisleuth.nlq.executor import PlanExecutor
+from omnisleuth.nlq.pipeline import AnalysisPipeline
 from omnisleuth.persistence import DatabaseManager, Repository
 from omnisleuth.persistence.serializer import safe_json_loads
 from omnisleuth.profiling import DatasetProfiler
 
 logger = get_logger("ui.app")
+
+
+def _render_chart(rows, spec):
+    """Render a chart from a computed table via the existing plotly stack.
+
+    Only ``ChartType``-allowlisted types are drawn, exactly as produced by
+    ``omnisleuth.nlq.charting``. No SQL, generated code, or dataframe query is used.
+    """
+    import plotly.express as _px
+
+    if not rows or not spec:
+        st.caption("No chart data available for this result.")
+        return
+
+    x_col = spec.get("x")
+    y_col = spec.get("y")
+    chart_type = spec.get("type", "bar")
+    title = spec.get("title") or (f"{y_col} by {x_col}" if x_col and y_col else "Result")
+
+    table = pd.DataFrame(rows)
+    if not x_col or x_col not in table.columns:
+        st.caption(f"Cannot chart: column '{x_col}' is not in the computed result.")
+        return
+    if y_col and y_col not in table.columns:
+        st.caption(f"Cannot chart: column '{y_col}' is not in the computed result.")
+        return
+
+    if chart_type == "line":
+        fig = _px.line(table, x=x_col, y=y_col, title=title)
+    elif chart_type == "scatter":
+        fig = _px.scatter(table, x=x_col, y=y_col, title=title)
+    elif chart_type == "pie":
+        fig = _px.pie(table, names=x_col, values=y_col, title=title)
+    elif chart_type == "histogram":
+        fig = _px.histogram(table, x=x_col, y=y_col, title=title)
+    else:  # bar and any unexpected value
+        fig = _px.bar(table, x=x_col, y=y_col, title=title, text_auto=True)
+
+    st.plotly_chart(fig, use_container_width=True)
+
 
 st.set_page_config(
     page_title="OmniSleuth",
@@ -242,6 +286,15 @@ if "df" not in st.session_state:
     st.session_state.df = None
     st.session_state.metadata = None
 
+for _key, _default in (
+    ("last_inv", None),
+    ("nlq_routing", None),
+    ("nlq_history", []),
+    ("llm_last_error_class", None),
+):
+    if _key not in st.session_state:
+        setattr(st.session_state, _key, _default)
+
 
 # ─────────────────────────────────────────────────────────────
 # SIDEBAR
@@ -310,9 +363,29 @@ with st.sidebar:
         llm_configured = bool(
             settings.openai_api_key or settings.azure_openai_api_key or settings.openrouter_api_key
         )
-        llm_mode_label = f"Configured ({settings.llm_provider.title()})" if llm_configured else "Offline (Deterministic Only)"
-        llm_mode_color = "#22C55E" if llm_configured else "#F59E0B"
+        last_error_class = st.session_state.get("llm_last_error_class")
         db_filename = Path(repo.db.db_path).name
+
+        # ONE status line: never key material, only provider/model state and last error class.
+        if not llm_configured:
+            st.sidebar.info(
+                "LLM not configured; showing deterministic results only. Claims and findings are computed "
+                "directly from raw data via allowlisted tools without generative text synthesis."
+            )
+            llm_mode_label = "Not configured (deterministic only)"
+            llm_mode_color = "#F59E0B"
+        else:
+            provider_name = (settings.llm_provider or "openrouter").lower()
+            if provider_name == "openrouter":
+                model_name = settings.openrouter_model
+            elif provider_name == "azure":
+                model_name = settings.llm_model
+            else:
+                model_name = settings.llm_model
+            llm_mode_label = f"Configured ({provider_name} · {model_name})"
+            llm_mode_color = "#22C55E"
+        if last_error_class:
+            llm_mode_label = f"{llm_mode_label} · last error: {last_error_class}"
 
         st.markdown(f"""
         <div style="padding:0.3rem 0;">
@@ -324,7 +397,7 @@ with st.sidebar:
             <div class="sidebar-value">SQLite &middot; {db_filename}</div>
         </div>
         <div style="padding:0.3rem 0;">
-            <div style="font-size:0.68rem;color:#475569;margin-bottom:0.1rem;">LLM Mode</div>
+            <div style="font-size:0.68rem;color:#475569;margin-bottom:0.1rem;">LLM status</div>
             <div style="font-size:0.78rem;color:{llm_mode_color};">{llm_mode_label}</div>
         </div>""", unsafe_allow_html=True)
     else:
@@ -370,45 +443,61 @@ st.markdown(f"""
 # ─────────────────────────────────────────────────────────────
 tabs = st.tabs([
     "Investigation", "Discovery", "Data Quality",
-    "Anomaly Explorer", "Evidence & Provenance", "Evaluation", "Ask Data",
+    "Anomaly Explorer", "Evidence & Provenance", "Evaluation",
 ])
 
 
 # ══════════════════════════════════════════════════════════════
-# TAB 1 — Investigation
+# TAB 1 — Investigation (single question box routed through AnalysisPipeline)
 # ══════════════════════════════════════════════════════════════
 with tabs[0]:
     st.markdown('<div class="section-label">Autonomous Investigation</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Investigate your data</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Ask one question</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="section-desc">Ask a business question. The multi-agent system generates a plan, '
-        'executes analytical tools, retrieves context, and validates all claims against evidence.</div>',
+        '<div class="section-desc">One question box plans your question into a structured analysis plan, '
+        'validates it against the dataset schema, and executes it deterministically. '
+        'Diagnostic "why" questions continue to the multi-agent pipeline.</div>',
         unsafe_allow_html=True)
 
-    EXAMPLE_QUESTIONS = [
-        "Why did revenue decline in March for Electronics in North region?",
-        "What is the monthly revenue trend across 2024?",
-        "Compare revenue distribution across categories and regions",
-        "Are there extreme anomaly transactions in sales volume?",
-        "What is the business definition and formula for Average Order Value (AOV)?",
-    ]
+    app_settings = get_settings()
+
+    # Planner selection stays explicit and opt-in: deterministic is the default.
+    PLANNER_OPTIONS = {
+        "Deterministic (rule-based)": "rule",
+        "LLM-assisted (validated plan)": "llm",
+    }
+    planner_label = st.radio(
+        "Planner",
+        list(PLANNER_OPTIONS.keys()),
+        index=0 if app_settings.nlq_planner_mode != "llm" else 1,
+        horizontal=True,
+        help="Deterministic planning needs no API key. LLM-assisted planning routes through the validated "
+             "LLMPlanner pipeline; every plan is still validated before execution.",
+    )
+    selected_mode = PLANNER_OPTIONS[planner_label]
+
+    if selected_mode == "llm":
+        from omnisleuth.llm.gateway import LLMGateway
+        if not LLMGateway().is_configured:
+            st.info(
+                "ℹ️ **LLM planner selected but no provider is configured.** No request will be made; "
+                "the deterministic planner is used instead."
+            )
+    else:
+        st.caption("Deterministic planner active. No model is contacted.")
 
     col_q, col_ex = st.columns([3, 2])
     with col_q:
         user_question = st.text_input(
-            "Question", value=EXAMPLE_QUESTIONS[0],
-            placeholder="e.g. Why did revenue decline in March?",
+            "Question",
+            placeholder="e.g. What is total revenue by category?",
             label_visibility="collapsed")
     with col_ex:
+        EXAMPLE_QUESTIONS = infer_example_questions(build_schema_context(df, metadata))
         selected_example = st.selectbox(
             "Example questions", [""] + EXAMPLE_QUESTIONS, label_visibility="collapsed")
         if selected_example:
             user_question = selected_example
-
-    settings = get_settings()
-    llm_configured = bool(settings.openai_api_key or settings.azure_openai_api_key)
-    if not llm_configured:
-        st.info("ℹ️ **LLM not configured; showing deterministic results only.** Claims and findings are computed directly from raw data via allowlisted tools without generative text synthesis.")
 
     btn_col, _ = st.columns([1, 3])
     with btn_col:
@@ -489,35 +578,212 @@ with tabs[0]:
                         "validation_results": [],
                         "final_answer": reopened.get("final_answer", ""),
                         "status": reopened.get("status", "completed"),
+                        "planner_used": reopened.get("planner_used"),
+                        "summary_text": reopened.get("summary_text"),
+                        "reopened_result_table": reopened.get("result_table"),
+                        "reopened_chart_spec": reopened.get("chart_spec"),
                     }
                     st.rerun()
 
     if run_investigation:
-        with st.spinner("Running multi-agent investigation\u2026"):
-            inv_res = orchestrator.run_investigation(user_question, df, metadata)
-            st.session_state.last_inv = inv_res
-            plan_dict = (
-                inv_res["plan"].model_dump()
-                if hasattr(inv_res.get("plan"), "model_dump")
-                else (inv_res.get("plan") or {})
-            )
-            if inv_res.get("evidence_store") is not None:
-                repo.save_investigation_results(
-                    investigation_id=f"inv_{metadata.dataset_id[:6]}_{int(pd.Timestamp.now().timestamp())}",
-                    dataset_id=metadata.dataset_id,
-                    question=user_question,
-                    status=inv_res["status"],
-                    plan_dict=plan_dict,
-                    final_answer=inv_res["final_answer"],
-                    evidence_store=inv_res["evidence_store"],
+        with st.spinner("Planning and executing\u2026"):
+            try:
+                # Reuse the app's cached repository and orchestrator so the routed
+                # question writes to the same store the history UI reads from.
+                _executor = PlanExecutor(repository=repo, orchestrator=orchestrator)
+                pipeline = AnalysisPipeline(
+                    mode=selected_mode,
+                    fallback=app_settings.nlq_planner_fallback,
+                    executor=_executor,
                 )
-                st.rerun()
+                routing = pipeline.run(
+                    user_question or "",
+                    df,
+                    metadata,
+                    history_ctx=list(st.session_state.get("nlq_history", [])),
+                )
+                st.session_state.nlq_routing = routing
+                st.session_state.nlq_history = (
+                    list(st.session_state.get("nlq_history", []))[-4:] + [routing.history_entry]
+                )[:5]
+                logger.info(
+                    "Question routed: planner=%s requested=%s fallback=%s",
+                    routing.planner_used, routing.requested_mode, routing.fallback_used,
+                )
 
-    if "last_inv" in st.session_state:
+                # Diagnostic answers are rendered by the multi-agent view; persist once.
+                if routing.deep_investigation and routing.result.status == "answered":
+                    _store = routing.result.evidence_store
+                    st.session_state.last_inv = {
+                        "question": user_question,
+                        "dataset_metadata": metadata,
+                        "plan": None,
+                        "executed_tasks": [],
+                        "evidence_store": _store,
+                        "hypotheses": _store.list_hypotheses() if _store is not None else [],
+                        "claims": routing.result.claims,
+                        "validation_results": [],
+                        "final_answer": routing.result.answer,
+                        "status": routing.result.status,
+                        "planner_used": routing.planner_used,
+                    }
+                    try:
+                        repo.save_investigation_results(
+                            investigation_id=(
+                                routing.result.investigation_id
+                                or f"inv_{metadata.dataset_id[:6]}_{int(pd.Timestamp.now().timestamp())}"
+                            ),
+                            dataset_id=metadata.dataset_id,
+                            question=user_question,
+                            status=routing.result.status,
+                            plan_dict=routing.result.plan.model_dump(),
+                            final_answer=routing.result.answer,
+                            evidence_store=_store,
+                            planner_used=routing.planner_used,
+                            summary_text=routing.result.plain_language_summary,
+                        )
+                    except Exception as exc:
+                        logger.warning(f"Could not persist deep investigation: {exc}")
+                    # Refresh the history list so the saved run can be reopened.
+                    st.rerun()
+            except Exception as exc:
+                logger.error(f"Investigation failed: {exc}", exc_info=True)
+                st.error(f"Request could not be completed: {type(exc).__name__}")
+
+    routing = st.session_state.get("nlq_routing")
+    if routing is not None:
+        _status = routing.result.status
+
+        # ── One status line: state, planner used, requested mode, LLM availability ──
+        _STATUS_STYLE = {
+            "answered": ("#22C55E", "Answered"),
+            "needs_clarification": ("#F59E0B", "Needs clarification"),
+            "unsupported": ("#64748B", "Unsupported"),
+            "failed": ("#EF4444", "Failed"),
+        }
+        status_color, status_text = _STATUS_STYLE.get(_status, ("#64748B", _status.title()))
+
+        st.markdown(
+            f'<div style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center;margin:0.75rem 0;">'
+            f'<span style="background:{status_color};color:#fff;border-radius:999px;padding:0.15rem 0.7rem;'
+            f'font-size:0.72rem;font-weight:600;">{status_text}</span>'
+            f'<span style="background:#E2E8F0;border-radius:999px;padding:0.15rem 0.7rem;'
+            f'font-size:0.72rem;font-weight:600;color:#334155;">Planner: {routing.planner_used}</span>'
+            f'<span style="background:#E2E8F0;border-radius:999px;padding:0.15rem 0.7rem;'
+            f'font-size:0.72rem;font-weight:600;color:#334155;">Requested: {routing.requested_mode}</span>'
+            f'<span style="background:#E2E8F0;border-radius:999px;padding:0.15rem 0.7rem;'
+            f'font-size:0.72rem;font-weight:600;color:#334155;">'
+            f'LLM: {"configured" if routing.llm_configured else "not configured"}</span></div>',
+            unsafe_allow_html=True)
+
+        if routing.fallback_used:
+            st.warning(f"Deterministic fallback was used: {routing.fallback_reason}")
+        if routing.followup_of:
+            st.caption(f"Follow-up on: \u201c{routing.followup_of}\u201d")
+        if routing.general_knowledge and _status == "answered":
+            st.info(
+                "**General knowledge, not computed from your dataset.** "
+                "No evidence or claims are shown because nothing here is derived from your data."
+            )
+
+        _interpretation = (
+            routing.result.plain_language_summary
+            or routing.result.plan.needs_clarification
+            or routing.result.plan.unsupported_reason
+            or ""
+        )
+        if _interpretation and _status != "answered" or (_interpretation and not routing.deep_investigation):
+            st.markdown(
+                f'<div class="summary-block">I interpreted this as: {_interpretation}</div>',
+                unsafe_allow_html=True)
+
+    # ── Unified result rendering: status-specific, evidence-grounded ──
+    routing = st.session_state.get("nlq_routing")
+    if routing is not None:
+        st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="font-size:0.78rem;color:#64748B;margin-bottom:0.2rem;">Result for:</div>'
+            f'<div style="font-size:1rem;font-weight:600;color:#0F1B2D;margin-bottom:1rem;">'
+            f'&ldquo;{user_question}&rdquo;</div>',
+            unsafe_allow_html=True)
+
+        _result = routing.result
+        if _result.status == "answered":
+            st.markdown(f'<div class="summary-block">{_result.answer}</div>', unsafe_allow_html=True)
+
+            if routing.general_knowledge:
+                pass
+            else:
+                if _result.result_table:
+                    st.markdown('<div class="section-label">Result Table</div>', unsafe_allow_html=True)
+                    st.dataframe(pd.DataFrame(_result.result_table), use_container_width=True, hide_index=True)
+
+                _chart = routing.chart
+                if _chart is not None and _chart.used and _chart.spec:
+                    st.markdown('<div class="section-label">Chart</div>', unsafe_allow_html=True)
+                    _render_chart(_chart.data, _chart.spec)
+                elif _chart is not None and _chart.explanation:
+                    st.caption(f"No chart shown: {_chart.explanation}")
+                    if _chart.suggestion:
+                        st.caption(f"Suggested instead: {_chart.suggestion}")
+
+                _ev_store = _result.evidence_store
+                if _ev_store is not None:
+                    ev_rows = [
+                        {"Source": ev.source_id, "Type": ev.evidence_type.value, "Confidence": f"{ev.confidence:.2f}"}
+                        for ev in _ev_store.list_evidence()
+                    ]
+                    if ev_rows:
+                        st.markdown('<div class="section-label">Evidence Grounding</div>', unsafe_allow_html=True)
+                        st.dataframe(pd.DataFrame(ev_rows), use_container_width=True, hide_index=True)
+                    clm_rows = [
+                        {"Statement": c.statement, "Status": c.status.value, "Notes": c.validation_notes or ""}
+                        for c in _ev_store.list_claims()
+                    ]
+                    if clm_rows:
+                        st.markdown('<div class="section-label">Validated Claims</div>', unsafe_allow_html=True)
+                        st.dataframe(pd.DataFrame(clm_rows), use_container_width=True, hide_index=True)
+
+                for limitation in _result.limitations:
+                    st.caption(f"Limitation: {limitation}")
+        else:
+            _status_explanation = {
+                "needs_clarification": "This question needs one more detail before it can be answered exactly.",
+                "unsupported": "This question cannot be answered from the current dataset schema.",
+                "failed": "This question could not be completed.",
+            }
+            st.error(
+                f"{_status_explanation.get(_result.status, _result.status.title())}\n\n{_result.answer}"
+            )
+            for limitation in _result.limitations:
+                st.caption(f"Limitation: {limitation}")
+
+    # Saved record (reopened or deep investigation) rendering
+    if st.session_state.get("last_inv") is not None:
         inv_res = st.session_state.last_inv
         store = inv_res.get("evidence_store")
 
         st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
+
+        # Planner badge and plan summary for saved records that carry them
+        if inv_res.get("planner_used"):
+            st.markdown(
+                f'<span style="background:#E2E8F0;border-radius:999px;padding:0.15rem 0.7rem;'
+                f'font-size:0.72rem;font-weight:600;color:#334155;">Planner: {inv_res["planner_used"]}</span>',
+                unsafe_allow_html=True)
+        if inv_res.get("summary_text"):
+            st.markdown(
+                f'<div class="summary-block">I interpreted this as: {inv_res["summary_text"]}</div>',
+                unsafe_allow_html=True)
+
+        # Persisted result table and chart, restored from the saved record
+        if inv_res.get("reopened_result_table"):
+            st.markdown('<div class="section-label">Result Table</div>', unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame(inv_res["reopened_result_table"]), use_container_width=True, hide_index=True)
+        if inv_res.get("reopened_chart_spec"):
+            _restored = inv_res["reopened_chart_spec"]
+            st.markdown('<div class="section-label">Chart</div>', unsafe_allow_html=True)
+            _render_chart(inv_res.get("reopened_result_table") or [], _restored)
 
         # Active question label
         st.markdown(
@@ -1017,7 +1283,7 @@ with tabs[4]:
         st.markdown('<div class="section-label">Saved Investigations History</div>', unsafe_allow_html=True)
         st.dataframe(pd.DataFrame(past_invs), use_container_width=True, hide_index=True)
 
-    if "last_inv" in st.session_state:
+    if st.session_state.get("last_inv") is not None:
         store = st.session_state.last_inv.get("evidence_store")
         ev_list = store.list_evidence() if store is not None else []
         st.markdown("<br>", unsafe_allow_html=True)
@@ -1149,121 +1415,3 @@ with tabs[5]:
             st.dataframe(comp_table, use_container_width=True, hide_index=True)
             st.info("Run 'Full Comparative Benchmark' to populate real empirical metrics for Baseline 1 and Baseline 2.")
 
-
-# ══════════════════════════════════════════════════════════════
-# TAB 7 — Ask Data (NLQ Planner Routing)
-# ══════════════════════════════════════════════════════════════
-with tabs[6]:
-    st.markdown('<div class="section-label">Ask Data</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Direct analytical questions</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="section-desc">Answers a question by planning it into a structured analysis plan, '
-        'validating that plan against the dataset schema, and executing it deterministically. '
-        'Choose the planner below.</div>',
-        unsafe_allow_html=True)
-
-    app_settings = get_settings()
-
-    PLANNER_OPTIONS = {
-        "Deterministic (rule-based)": "rule",
-        "LLM-assisted (validated plan)": "llm",
-    }
-    mode_label = st.radio(
-        "Planner",
-        list(PLANNER_OPTIONS.keys()),
-        index=0 if app_settings.nlq_planner_mode != "llm" else 1,
-        horizontal=True,
-        help="Deterministic planning needs no API key. LLM-assisted planning routes through the validated "
-             "LLMPlanner pipeline; every plan is still validated before execution.",
-    )
-    selected_mode = PLANNER_OPTIONS[mode_label]
-
-    if selected_mode == "llm":
-        from omnisleuth.llm.gateway import LLMGateway
-        if not LLMGateway().is_configured:
-            st.info(
-                "ℹ️ **LLM planner selected but no provider is configured.** No request will be made; "
-                "the deterministic planner is used instead."
-            )
-    else:
-        st.caption("Deterministic planner active. No model is contacted.")
-
-    nlq_question = st.text_input(
-        "Question",
-        placeholder="e.g. What is total revenue by category?",
-        key="nlq_question",
-        label_visibility="collapsed",
-    )
-
-    if st.button("Get Answer", key="nlq_run", type="primary"):
-        with st.spinner("Planning and executing\u2026"):
-            try:
-                from omnisleuth.nlq.pipeline import AnalysisPipeline
-
-                pipeline = AnalysisPipeline(
-                    mode=selected_mode,
-                    fallback=app_settings.nlq_planner_fallback,
-                )
-                routing = pipeline.run(nlq_question or "", df, metadata)
-                st.session_state.nlq_routing = routing
-            except Exception as exc:
-                logger.error(f"Ask Data failed: {exc}", exc_info=True)
-                st.error(f"Request could not be completed: {type(exc).__name__}")
-
-    routing = st.session_state.get("nlq_routing")
-    if routing is not None:
-        # Active planner mode and fallback status are always reported explicitly.
-        fallback_note = (
-            f"Deterministic fallback used: {routing.fallback_reason}"
-            if routing.fallback_used and routing.fallback_reason
-            else ("Deterministic fallback used." if routing.fallback_used else None)
-        )
-        if fallback_note:
-            st.warning(fallback_note)
-
-        mode_caption = (
-            f"Requested: **{routing.requested_mode}** &nbsp;|&nbsp; "
-            f"Planner used: **{routing.planner_used}** &nbsp;|&nbsp; "
-            f"LLM configured: **{'yes' if routing.llm_configured else 'no'}**"
-        )
-        st.markdown(f'<div class="section-desc">{mode_caption}</div>', unsafe_allow_html=True)
-
-        result = routing.result
-        if result.status == "answered":
-            st.markdown(
-                f'<div class="summary-block">{result.answer}</div>',
-                unsafe_allow_html=True)
-            if result.result_table:
-                st.dataframe(pd.DataFrame(result.result_table), use_container_width=True, hide_index=True)
-            if result.plain_language_summary:
-                st.caption(result.plain_language_summary)
-            ev_store = result.evidence_store
-            if ev_store is not None:
-                evidence_items = ev_store.list_evidence()
-                if evidence_items:
-                    ev_rows = [
-                        {
-                            "Source": ev.source_id,
-                            "Type": ev.evidence_type.value,
-                            "Confidence": f"{ev.confidence:.2f}",
-                        }
-                        for ev in evidence_items
-                    ]
-                    st.markdown('<div class="section-label">Evidence Grounding</div>', unsafe_allow_html=True)
-                    st.dataframe(pd.DataFrame(ev_rows), use_container_width=True, hide_index=True)
-                claims = ev_store.list_claims()
-                if claims:
-                    claim_rows = [
-                        {
-                            "Statement": clm.statement,
-                            "Status": clm.status.value,
-                            "Notes": clm.validation_notes or "",
-                        }
-                        for clm in claims
-                    ]
-                    st.markdown('<div class="section-label">Validated Claims</div>', unsafe_allow_html=True)
-                    st.dataframe(pd.DataFrame(claim_rows), use_container_width=True, hide_index=True)
-        else:
-            st.error(result.answer or "The question could not be answered deterministically.")
-            for limitation in result.limitations:
-                st.caption(limitation)
