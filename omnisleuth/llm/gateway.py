@@ -11,11 +11,15 @@ from omnisleuth.llm.providers import (
     BaseProvider,
     DeterministicFallbackProvider,
     OpenAIProvider,
+    OpenRouterProvider,
 )
 from omnisleuth.llm.retry import RetryExhaustedError, execute_with_retry
-from omnisleuth.llm.tracing import LLMTracer, generate_request_id
+from omnisleuth.llm.tracing import LLMTracer, generate_request_id, sanitize_text
 
 logger = get_logger("llm.gateway")
+
+# Provider name that unambiguously identifies the offline deterministic fallback.
+FALLBACK_PROVIDER_NAME = "fallback"
 
 
 class LLMGateway:
@@ -45,6 +49,8 @@ class LLMGateway:
             return True
         if prov == "azure" and bool(self.settings.azure_openai_api_key):
             return True
+        if prov == "openrouter" and bool(self.settings.openrouter_api_key):
+            return True
         return False
 
     def _get_provider(self, requested_provider_name: Optional[str] = None) -> BaseProvider:
@@ -58,9 +64,25 @@ class LLMGateway:
             return OpenAIProvider()
         elif prov_name == "azure" and self.settings.azure_openai_api_key:
             return AzureOpenAIProvider()
+        elif prov_name == "openrouter" and self.settings.openrouter_api_key:
+            return OpenRouterProvider()
 
         # Fall back to offline deterministic provider
         return self.fallback_provider
+
+    def is_fallback_response(self, response: LLMResponse) -> bool:
+        """Return True if a response was produced by the deterministic fallback.
+
+        Callers (e.g. LLMPlanner) MUST use this to distinguish a genuine LLM
+        answer from offline fallback text; fallback text is never a valid model
+        output and must not be parsed as if the model had produced it.
+        """
+        return bool(
+            response.fallback_used
+            or response.provider == FALLBACK_PROVIDER_NAME
+            or response.model == "deterministic"
+            or (response.error is not None)
+        )
 
     def generate(self, request: LLMRequest) -> LLMResponse:
         """Execute structured LLM request through central gateway pipeline:
@@ -111,7 +133,7 @@ class LLMGateway:
             response = self.fallback_provider.generate(request, request_id)
             response.fallback_used = True
             response.retry_count = retry_count
-            response.error = f"Primary provider failed ({exc.original_exc}). Activated offline fallback."
+            response.error = sanitize_text(f"Primary provider failed ({exc}). Activated offline fallback.")
 
         except Exception as exc:
             # 4. On provider failure or missing key, fall back to offline provider
@@ -119,7 +141,7 @@ class LLMGateway:
             response = self.fallback_provider.generate(request, request_id)
             response.fallback_used = True
             response.retry_count = retry_count
-            response.error = f"Primary provider failed ({exc}). Activated offline fallback."
+            response.error = sanitize_text(f"Primary provider failed ({exc}). Activated offline fallback.")
 
         # 5. Log audit trace & store in cache
         self.tracer.log_request(request, response)

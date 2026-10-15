@@ -61,3 +61,9 @@ htmlcov/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local tooling state
+.kilo/
+
+# Generated evaluation results
+omnisleuth/evaluation/results/

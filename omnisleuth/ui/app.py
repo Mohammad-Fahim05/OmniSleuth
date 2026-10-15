@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from omnisleuth.agents import MultiAgentOrchestrator
 from omnisleuth.core.config import get_settings
+from omnisleuth.core.logging import get_logger
 from omnisleuth.discovery import DatasetDiscoveryScanner
 from omnisleuth.evaluation import BENCHMARK_QUESTIONS, OmniSleuthEvaluator, generate_benchmark_sales_dataset
 from omnisleuth.evidence.models import (
@@ -25,6 +26,8 @@ from omnisleuth.ml.detectors import IQRAnomalyDetector, IsolationForestDetector
 from omnisleuth.persistence import DatabaseManager, Repository
 from omnisleuth.persistence.serializer import safe_json_loads
 from omnisleuth.profiling import DatasetProfiler
+
+logger = get_logger("ui.app")
 
 st.set_page_config(
     page_title="OmniSleuth",
@@ -304,7 +307,9 @@ with st.sidebar:
         st.markdown("<hr>", unsafe_allow_html=True)
         st.markdown('<div class="sidebar-section">System</div>', unsafe_allow_html=True)
         settings = get_settings()
-        llm_configured = bool(settings.openai_api_key or settings.azure_openai_api_key)
+        llm_configured = bool(
+            settings.openai_api_key or settings.azure_openai_api_key or settings.openrouter_api_key
+        )
         llm_mode_label = f"Configured ({settings.llm_provider.title()})" if llm_configured else "Offline (Deterministic Only)"
         llm_mode_color = "#22C55E" if llm_configured else "#F59E0B"
         db_filename = Path(repo.db.db_path).name
@@ -365,7 +370,7 @@ st.markdown(f"""
 # ─────────────────────────────────────────────────────────────
 tabs = st.tabs([
     "Investigation", "Discovery", "Data Quality",
-    "Anomaly Explorer", "Evidence & Provenance", "Evaluation",
+    "Anomaly Explorer", "Evidence & Provenance", "Evaluation", "Ask Data",
 ])
 
 
@@ -1143,3 +1148,122 @@ with tabs[5]:
             ])
             st.dataframe(comp_table, use_container_width=True, hide_index=True)
             st.info("Run 'Full Comparative Benchmark' to populate real empirical metrics for Baseline 1 and Baseline 2.")
+
+
+# ══════════════════════════════════════════════════════════════
+# TAB 7 — Ask Data (NLQ Planner Routing)
+# ══════════════════════════════════════════════════════════════
+with tabs[6]:
+    st.markdown('<div class="section-label">Ask Data</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Direct analytical questions</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="section-desc">Answers a question by planning it into a structured analysis plan, '
+        'validating that plan against the dataset schema, and executing it deterministically. '
+        'Choose the planner below.</div>',
+        unsafe_allow_html=True)
+
+    app_settings = get_settings()
+
+    PLANNER_OPTIONS = {
+        "Deterministic (rule-based)": "rule",
+        "LLM-assisted (validated plan)": "llm",
+    }
+    mode_label = st.radio(
+        "Planner",
+        list(PLANNER_OPTIONS.keys()),
+        index=0 if app_settings.nlq_planner_mode != "llm" else 1,
+        horizontal=True,
+        help="Deterministic planning needs no API key. LLM-assisted planning routes through the validated "
+             "LLMPlanner pipeline; every plan is still validated before execution.",
+    )
+    selected_mode = PLANNER_OPTIONS[mode_label]
+
+    if selected_mode == "llm":
+        from omnisleuth.llm.gateway import LLMGateway
+        if not LLMGateway().is_configured:
+            st.info(
+                "ℹ️ **LLM planner selected but no provider is configured.** No request will be made; "
+                "the deterministic planner is used instead."
+            )
+    else:
+        st.caption("Deterministic planner active. No model is contacted.")
+
+    nlq_question = st.text_input(
+        "Question",
+        placeholder="e.g. What is total revenue by category?",
+        key="nlq_question",
+        label_visibility="collapsed",
+    )
+
+    if st.button("Get Answer", key="nlq_run", type="primary"):
+        with st.spinner("Planning and executing\u2026"):
+            try:
+                from omnisleuth.nlq.pipeline import AnalysisPipeline
+
+                pipeline = AnalysisPipeline(
+                    mode=selected_mode,
+                    fallback=app_settings.nlq_planner_fallback,
+                )
+                routing = pipeline.run(nlq_question or "", df, metadata)
+                st.session_state.nlq_routing = routing
+            except Exception as exc:
+                logger.error(f"Ask Data failed: {exc}", exc_info=True)
+                st.error(f"Request could not be completed: {type(exc).__name__}")
+
+    routing = st.session_state.get("nlq_routing")
+    if routing is not None:
+        # Active planner mode and fallback status are always reported explicitly.
+        fallback_note = (
+            f"Deterministic fallback used: {routing.fallback_reason}"
+            if routing.fallback_used and routing.fallback_reason
+            else ("Deterministic fallback used." if routing.fallback_used else None)
+        )
+        if fallback_note:
+            st.warning(fallback_note)
+
+        mode_caption = (
+            f"Requested: **{routing.requested_mode}** &nbsp;|&nbsp; "
+            f"Planner used: **{routing.planner_used}** &nbsp;|&nbsp; "
+            f"LLM configured: **{'yes' if routing.llm_configured else 'no'}**"
+        )
+        st.markdown(f'<div class="section-desc">{mode_caption}</div>', unsafe_allow_html=True)
+
+        result = routing.result
+        if result.status == "answered":
+            st.markdown(
+                f'<div class="summary-block">{result.answer}</div>',
+                unsafe_allow_html=True)
+            if result.result_table:
+                st.dataframe(pd.DataFrame(result.result_table), use_container_width=True, hide_index=True)
+            if result.plain_language_summary:
+                st.caption(result.plain_language_summary)
+            ev_store = result.evidence_store
+            if ev_store is not None:
+                evidence_items = ev_store.list_evidence()
+                if evidence_items:
+                    ev_rows = [
+                        {
+                            "Source": ev.source_id,
+                            "Type": ev.evidence_type.value,
+                            "Confidence": f"{ev.confidence:.2f}",
+                        }
+                        for ev in evidence_items
+                    ]
+                    st.markdown('<div class="section-label">Evidence Grounding</div>', unsafe_allow_html=True)
+                    st.dataframe(pd.DataFrame(ev_rows), use_container_width=True, hide_index=True)
+                claims = ev_store.list_claims()
+                if claims:
+                    claim_rows = [
+                        {
+                            "Statement": clm.statement,
+                            "Status": clm.status.value,
+                            "Notes": clm.validation_notes or "",
+                        }
+                        for clm in claims
+                    ]
+                    st.markdown('<div class="section-label">Validated Claims</div>', unsafe_allow_html=True)
+                    st.dataframe(pd.DataFrame(claim_rows), use_container_width=True, hide_index=True)
+        else:
+            st.error(result.answer or "The question could not be answered deterministically.")
+            for limitation in result.limitations:
+                st.caption(limitation)

@@ -40,12 +40,17 @@ class Settings(BaseSettings):
     embedding_model: str = Field(default="text-embedding-3-small", description="Default embeddings model")
 
     # Phase 19 LLM Gateway Settings
-    llm_provider: str = Field(default="fallback", description="LLM provider: 'openai', 'azure', or 'fallback'")
+    llm_provider: str = Field(default="fallback", description="LLM provider: 'openai', 'azure', 'openrouter', or 'fallback'")
     llm_model: str = Field(default="gpt-4o-mini", description="Primary LLM model name")
     llm_timeout_seconds: float = Field(default=30.0, description="LLM request timeout in seconds")
     llm_max_retries: int = Field(default=3, description="Maximum retries for transient LLM errors")
     llm_retry_base_delay: float = Field(default=1.0, description="Base exponential backoff delay in seconds")
     llm_retry_max_delay: float = Field(default=10.0, description="Maximum exponential backoff delay in seconds")
+
+    # OpenRouter (Optional, OpenAI-compatible API)
+    openrouter_api_key: Optional[str] = Field(default=None, description="OpenRouter API key")
+    openrouter_model: str = Field(default="openai/gpt-4o-mini", description="Default OpenRouter model")
+    openrouter_base_url: str = Field(default="https://openrouter.ai/api/v1", description="OpenRouter API base URL")
 
     # Azure OpenAI (Optional)
     azure_openai_api_key: Optional[str] = Field(default=None, description="Azure OpenAI API key")
@@ -56,6 +61,16 @@ class Settings(BaseSettings):
     # Pricing & Metering
     llm_input_price_per_1k: Optional[float] = Field(default=0.00015, description="Input price per 1,000 tokens in USD")
     llm_output_price_per_1k: Optional[float] = Field(default=0.00060, description="Output price per 1,000 tokens in USD")
+
+    # Phase C1/C2 NLQ Planner Selection
+    nlq_planner_mode: str = Field(
+        default="rule",
+        description="NLQ planner selection: 'rule' (deterministic, default) or 'llm' (LLM-assisted)",
+    )
+    nlq_planner_fallback: str = Field(
+        default="rule",
+        description="Fallback policy when LLM planning fails: 'rule' (deterministic) or 'fail'",
+    )
 
     # Semantic Cache
     llm_cache_enabled: bool = Field(default=False, description="Enable optional semantic cache")

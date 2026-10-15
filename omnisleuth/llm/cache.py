@@ -21,12 +21,19 @@ class SemanticCache:
         self._store: Dict[str, LLMResponse] = {}
 
     def _compute_key(self, request: LLMRequest) -> str:
-        """Build deterministic cache key incorporating dataset version, model, and prompt text."""
+        """Build deterministic cache key incorporating dataset version, model, provider, and prompt text.
+
+        Provider identity is part of the key so that two providers offering the
+        same model name (e.g. OpenAI and OpenRouter both serving 'gpt-4o-mini')
+        can never serve each other's cached responses. Prompt text incorporates
+        the dataset profile, so any schema change also changes the key.
+        """
         dataset_v = request.dataset_version or "no_dataset"
-        model_name = request.model or request.provider or "default_model"
+        provider_name = (request.provider or "default_provider").lower()
+        model_name = (request.model or "default_model").lower()
         prompt_text = request.get_prompt_text().strip().lower()
 
-        raw_key = f"{dataset_v}::{model_name}::{prompt_text}"
+        raw_key = f"{dataset_v}::{provider_name}::{model_name}::{prompt_text}"
         return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
     def get(self, request: LLMRequest) -> Optional[LLMResponse]:
