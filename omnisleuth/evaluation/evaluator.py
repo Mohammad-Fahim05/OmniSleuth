@@ -156,6 +156,37 @@ def _compute_completeness_score(
     return score
 
 
+def _tool_selection_correct(
+    expected_tools: List[str],
+    executed_tools: List[str],
+) -> Optional[bool]:
+    """Check whether all distinct expected tools were executed.
+
+    Return None when no tools are expected.
+    """
+    expected = set(expected_tools)
+    if not expected:
+        return None
+    return expected.issubset(set(executed_tools))
+
+
+def _tool_selection_accuracy(
+    expected_tools: List[List[str]],
+    executed_tools: List[List[str]],
+) -> float:
+    """Calculate accuracy only for questions with expected tools."""
+    eligible = [
+        _tool_selection_correct(expected, executed)
+        for expected, executed in zip(expected_tools, executed_tools)
+        if expected
+    ]
+
+    if not eligible:
+        return 0.0
+
+    correct = sum(result is True for result in eligible)
+    return round(correct / len(eligible) * 100.0, 2)
+
 def _get_default_tool_params(tool_name: str, metadata: DatasetMetadata) -> Dict[str, Any]:
     """Provide schema-compliant default arguments for isolated tool executions."""
     metric_col = metadata.numeric_columns[0] if metadata.numeric_columns else "revenue"
@@ -213,7 +244,6 @@ class OmniSleuthEvaluator:
 
         per_question: List[PerQuestionResult] = []
         latencies_ms: List[float] = []
-        correct_tools_count = 0
         supported_claims_count = 0
         unsupported_claims_count = 0
         total_claims_count = 0
@@ -237,10 +267,8 @@ class OmniSleuthEvaluator:
                 executed_tools: List[str] = []
                 if res.get("executed_tasks"):
                     executed_tools = [t.tool_name for t in res["executed_tasks"] if t.tool_name]
-                executed_set = set(executed_tools)
-                tool_correct = any(exp_t in executed_set for exp_t in bq.expected_tools) if bq.expected_tools else True
-                if tool_correct:
-                    correct_tools_count += 1
+                corr = _tool_selection_correct(bq.expected_tools, executed_tools)
+                tool_correct = True if corr is None else corr
 
                 # 2. Evidence Coverage
                 ev_count = 0
@@ -315,7 +343,10 @@ class OmniSleuthEvaluator:
             round((supported_claims_count / total_claims_count * 100.0), 2)
             if total_claims_count > 0 else 100.0
         )
-        tool_acc = round((correct_tools_count / total_q * 100.0), 2)
+        tool_acc = _tool_selection_accuracy(
+            [p.tools_expected for p in per_question],
+            [p.tools_executed for p in per_question],
+        )
         ev_cov = min(100.0, round((evidence_covered_count / succeeding_q * 100.0), 2)) if succeeding_q > 0 else 0.0
         unsupported_rate = (
             round((unsupported_claims_count / total_claims_count * 100.0), 2)
@@ -366,7 +397,6 @@ class OmniSleuthEvaluator:
         registry = get_default_tool_registry()
         per_question: List[PerQuestionResult] = []
         latencies_ms: List[float] = []
-        correct_tools = 0
         evidence_covered = 0
         completeness_scores: List[float] = []
         keyword_rates: List[float] = []
@@ -406,9 +436,8 @@ class OmniSleuthEvaluator:
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
                 latencies_ms.append(elapsed_ms)
 
-                tool_correct = bool(executed_tools)
-                if tool_correct:
-                    correct_tools += 1
+                corr = _tool_selection_correct(bq.expected_tools, executed_tools)
+                tool_correct = True if corr is None else corr
 
                 has_evidence = bool(result_text)
                 if has_evidence:
@@ -461,7 +490,10 @@ class OmniSleuthEvaluator:
             system_name="Baseline 1 — Direct Analytical Tools (no agents)",
             total_questions=total_q,
             numerical_correctness_pct=0.0,  # No claim validation
-            tool_selection_accuracy_pct=round((correct_tools / total_q * 100.0), 2),
+            tool_selection_accuracy_pct=_tool_selection_accuracy(
+                [p.tools_expected for p in per_question],
+                [p.tools_executed for p in per_question],
+            ),
             evidence_coverage_pct=round((evidence_covered / succeeding_q * 100.0), 2) if succeeding_q > 0 else 0.0,
             unsupported_claim_rate_pct=100.0,  # No claim validation → all claims unverified
             investigation_completeness_pct=round(float(np.mean(completeness_scores) * 100.0), 2) if completeness_scores else 0.0,
@@ -493,7 +525,6 @@ class OmniSleuthEvaluator:
         validator = ClaimValidator()
         per_question: List[PerQuestionResult] = []
         latencies_ms: List[float] = []
-        correct_tools = 0
         evidence_covered = 0
         supported_total = 0
         unsupported_total = 0
@@ -544,9 +575,8 @@ class OmniSleuthEvaluator:
                 elapsed_ms = (time.perf_counter() - t0) * 1000.0
                 latencies_ms.append(elapsed_ms)
 
-                tool_correct = any(t in set(executed_tools) for t in bq.expected_tools) if bq.expected_tools else True
-                if tool_correct:
-                    correct_tools += 1
+                corr = _tool_selection_correct(bq.expected_tools, executed_tools)
+                tool_correct = True if corr is None else corr
 
                 ev_items = store.list_evidence()
                 ev_count = len(ev_items)
@@ -621,7 +651,10 @@ class OmniSleuthEvaluator:
             system_name="Baseline 2 — Fixed Pipeline (Tools + Evidence, no agents)",
             total_questions=total_q,
             numerical_correctness_pct=num_correctness,
-            tool_selection_accuracy_pct=round((correct_tools / total_q * 100.0), 2),
+            tool_selection_accuracy_pct=_tool_selection_accuracy(
+                [p.tools_expected for p in per_question],
+                [p.tools_executed for p in per_question],
+            ),
             evidence_coverage_pct=round((evidence_covered / succeeding_q * 100.0), 2) if succeeding_q > 0 else 0.0,
             unsupported_claim_rate_pct=round((unsupported_total / claims_total * 100.0), 2) if claims_total > 0 else 100.0,
             investigation_completeness_pct=round(float(np.mean(completeness_scores) * 100.0), 2) if completeness_scores else 0.0,
