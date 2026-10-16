@@ -3,12 +3,14 @@
 import os
 from pathlib import Path
 import tempfile
+import uuid
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from omnisleuth.agents import MultiAgentOrchestrator
 from omnisleuth.core.config import get_settings
+from omnisleuth.core.exceptions import IngestionError
 from omnisleuth.core.logging import get_logger
 from omnisleuth.discovery import DatasetDiscoveryScanner
 from omnisleuth.evaluation import BENCHMARK_QUESTIONS, OmniSleuthEvaluator, generate_benchmark_sales_dataset
@@ -21,7 +23,7 @@ from omnisleuth.evidence.models import (
     HypothesisStatus,
 )
 from omnisleuth.evidence.store import EvidenceStore
-from omnisleuth.ingestion import CSVLoader
+from omnisleuth.ingestion import CSVLoader, safe_cleanup_file, safe_save_upload
 from omnisleuth.ml.detectors import IQRAnomalyDetector, IsolationForestDetector
 from omnisleuth.nlq.charting import infer_example_questions
 from omnisleuth.nlq.context import build_schema_context
@@ -282,6 +284,16 @@ def get_services():
 
 repo, orchestrator, scanner, profiler, evaluator = get_services()
 
+
+def get_or_create_session_id() -> str:
+    """Obtain or securely generate an opaque session identifier for this Streamlit browser session."""
+    if "session_id" not in st.session_state or not st.session_state.session_id:
+        st.session_state.session_id = f"sess_{uuid.uuid4().hex[:16]}"
+    return st.session_state.session_id
+
+
+current_session_id = get_or_create_session_id()
+
 if "df" not in st.session_state:
     st.session_state.df = None
     st.session_state.metadata = None
@@ -320,24 +332,109 @@ with st.sidebar:
             sample_path.parent.mkdir(parents=True, exist_ok=True)
             generate_benchmark_sales_dataset(n_rows=1000, random_seed=42, output_path=sample_path)
             loader = CSVLoader()
-            df, meta = loader.load_csv(sample_path, dataset_name="Benchmark Sales 2024")
-            repo.save_dataset(meta)
+            df, meta = loader.load_csv(
+                sample_path,
+                dataset_name="Benchmark Sales 2024",
+                session_id=current_session_id,
+            )
+            repo.save_dataset(meta, session_id=current_session_id)
             st.session_state.df = df
             st.session_state.metadata = meta
     else:
         uploaded_file = st.file_uploader(
-            "Upload dataset", type=["csv", "txt", "xlsx", "xls"], label_visibility="visible"
+            "Upload dataset", type=["csv", "parquet", "xlsx"], label_visibility="visible"
         )
         if uploaded_file is not None:
-            suffix = Path(uploaded_file.name).suffix.lower() or ".csv"
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                tmp.write(uploaded_file.getvalue())
-                tmp_path = tmp.name
-            loader = CSVLoader()
-            df, meta = loader.load_csv(tmp_path, dataset_name=uploaded_file.name)
-            repo.save_dataset(meta)
-            st.session_state.df = df
-            st.session_state.metadata = meta
+            max_upload_size = get_settings().max_upload_size_bytes
+            dest_path = None
+            try:
+                # 1. Sanitize filename, enforce filesystem containment, stream chunked to isolated unique path
+                safe_path, display_name = safe_save_upload(
+                    file_obj=uploaded_file,
+                    raw_filename=uploaded_file.name,
+                    upload_dir=get_settings().uploads_dir,
+                    max_size_bytes=max_upload_size,
+                )
+                dest_path = safe_path
+
+                # 2. Parse and validate content via CSVLoader
+                loader = CSVLoader()
+                df, meta = loader.load_csv(
+                    safe_path,
+                    dataset_name=display_name,
+                    session_id=current_session_id,
+                )
+                repo.save_dataset(
+                    meta,
+                    verify_file=True,
+                    cleanup_on_failure=True,
+                    session_id=current_session_id,
+                )
+                st.session_state.df = df
+                st.session_state.metadata = meta
+            except IngestionError as exc:
+                logger.warning(f"Upload validation failed for '{uploaded_file.name}': {exc}")
+                st.error(f"Upload failed: {exc}")
+                if dest_path and dest_path.exists() and st.session_state.df is None:
+                    safe_cleanup_file(dest_path)
+            except Exception as exc:
+                logger.error(f"Unexpected error loading dataset '{uploaded_file.name}': {exc}", exc_info=True)
+                st.error(f"Failed to process uploaded file '{uploaded_file.name}'. Please ensure it is a valid CSV, Parquet, or XLSX file.")
+                if dest_path and dest_path.exists() and st.session_state.df is None:
+                    safe_cleanup_file(dest_path)
+
+    # Saved datasets in this session
+    session_saved = repo.list_datasets(check_files=True, session_id=current_session_id)
+    if session_saved:
+        with st.expander(f"Saved Session Datasets ({len(session_saved)})", expanded=False):
+            ds_choices = {}
+            for d in session_saved:
+                f_status = "" if d.get("file_exists", True) else " ⚠️ (File missing)"
+                ds_choices[f"{d['name']} ({d['row_count']:,} rows){f_status}"] = d
+            chosen_label = st.selectbox(
+                "Choose saved dataset",
+                list(ds_choices.keys()),
+                key="select_saved_ds",
+            )
+            if st.button("Activate Dataset", key="btn_load_saved_ds", use_container_width=True):
+                chosen_rec = ds_choices[chosen_label]
+                if not chosen_rec.get("file_exists", True):
+                    st.error(f"Cannot load '{chosen_rec['name']}': File is missing from storage.")
+                else:
+                    try:
+                        loaded_df, loaded_meta = repo.load_dataset_dataframe(
+                            chosen_rec["dataset_id"], session_id=current_session_id
+                        )
+                        st.session_state.df = loaded_df
+                        st.session_state.metadata = loaded_meta
+                        st.session_state.last_inv = None
+                        st.rerun()
+                    except IngestionError as exc:
+                        st.error(f"Failed to load dataset: {exc}")
+
+    with st.expander("Session & Recovery", expanded=False):
+        st.markdown(
+            f'<div style="font-size:0.75rem;color:#94A3B8;">Current Session ID:</div>'
+            f'<div class="sidebar-value" style="font-family:monospace;font-size:0.75rem;word-break:break-all;">{current_session_id}</div>',
+            unsafe_allow_html=True,
+        )
+        reconnect_id = st.text_input("Resume session ID", key="reconnect_session_input", placeholder="sess_...")
+        if st.button("Resume Session", key="btn_reconnect_session", use_container_width=True):
+            if reconnect_id.strip():
+                clean_id = reconnect_id.strip()
+                existing_ds = repo.list_datasets(check_files=False, session_id=clean_id)
+                existing_inv = repo.list_investigations(session_id=clean_id)
+                if existing_ds or existing_inv:
+                    st.session_state.session_id = clean_id
+                    st.session_state.df = None
+                    st.session_state.metadata = None
+                    st.session_state.last_inv = None
+                    st.success(f"Resumed session: {clean_id}")
+                    st.rerun()
+                else:
+                    st.error("Session ID not found or contains no persisted records.")
+            else:
+                st.warning("Please enter a valid session ID.")
 
     st.markdown("<hr>", unsafe_allow_html=True)
     if st.session_state.df is not None:
@@ -504,7 +601,9 @@ with tabs[0]:
         run_investigation = st.button("Investigate", type="primary", use_container_width=True)
 
     # Investigation History Reopening Flow
-    past_investigations = repo.list_investigations(dataset_id=metadata.dataset_id)
+    past_investigations = repo.list_investigations(
+        dataset_id=metadata.dataset_id, session_id=current_session_id
+    )
     if past_investigations:
         with st.expander(f"Investigation History ({len(past_investigations)} saved)", expanded=False):
             inv_options = {
@@ -518,74 +617,46 @@ with tabs[0]:
             )
             if st.button("Reopen Investigation", key="reopen_btn"):
                 selected_id = inv_options[selected_label]
-                reopened = repo.get_investigation(selected_id)
-                if reopened:
-                    reconstructed_store = EvidenceStore(
-                        dataset_id=reopened["dataset_id"],
-                        dataset_version=metadata.version_hash,
-                    )
-                    for ev_dict in reopened.get("evidence_items", []):
-                        content = ev_dict.get("content") or (
-                            safe_json_loads(ev_dict.get("content_json"), default={})
-                            if isinstance(ev_dict.get("content_json"), str)
-                            else {}
-                        )
-                        ev_item = EvidenceItem(
-                            evidence_id=ev_dict["evidence_id"],
-                            evidence_type=EvidenceType(ev_dict["evidence_type"]),
-                            source_id=ev_dict["source_id"],
-                            location=ev_dict.get("location"),
-                            content=content,
-                            confidence=ev_dict.get("confidence", 1.0),
-                            related_tool_execution_id=ev_dict.get("related_tool_execution_id"),
-                        )
-                        reconstructed_store.add_evidence(ev_item)
-
-                    for hyp_dict in reopened.get("hypotheses", []):
-                        hyp_item = Hypothesis(
-                            hypothesis_id=hyp_dict["hypothesis_id"],
-                            statement=hyp_dict["statement"],
-                            status=HypothesisStatus(hyp_dict["status"]),
-                            confidence=hyp_dict.get("confidence", 1.0),
-                            findings_summary=hyp_dict.get("findings_summary"),
-                        )
-                        reconstructed_store.add_hypothesis(hyp_item)
-
-                    for clm_dict in reopened.get("claims", []):
-                        clm_item = Claim(
-                            claim_id=clm_dict["claim_id"],
-                            statement=clm_dict["statement"],
-                            status=ClaimStatus(clm_dict["status"]),
-                            validation_notes=clm_dict.get("validation_notes"),
-                        )
-                        reconstructed_store.add_claim(clm_item)
-
-                    reopened_plan = reopened.get("plan") or {}
-                    reconstructed_tasks = (
-                        reopened_plan.get("tasks", [])
-                        if isinstance(reopened_plan, dict)
-                        else []
-                    )
-
+                reopened_state = repo.reconstruct_investigation_state(
+                    selected_id, session_id=current_session_id
+                )
+                if reopened_state:
+                    inv_meta = metadata or reopened_state.get("dataset_metadata")
                     st.session_state.last_inv = {
-                        "question": reopened["question"],
-                        "dataset_metadata": metadata,
-                        "plan": reopened.get("plan"),
-                        "executed_tasks": reconstructed_tasks,
-                        "evidence_store": reconstructed_store,
-                        "hypotheses": reconstructed_store.list_hypotheses(),
-                        "claims": reconstructed_store.list_claims(),
+                        "question": reopened_state["question"],
+                        "dataset_metadata": inv_meta,
+                        "plan": reopened_state.get("plan"),
+                        "executed_tasks": reopened_state.get("executed_tasks", []),
+                        "evidence_store": reopened_state["evidence_store"],
+                        "hypotheses": reopened_state["hypotheses"],
+                        "claims": reopened_state["claims"],
                         "validation_results": [],
-                        "final_answer": reopened.get("final_answer", ""),
-                        "status": reopened.get("status", "completed"),
-                        "planner_used": reopened.get("planner_used"),
-                        "summary_text": reopened.get("summary_text"),
-                        "reopened_result_table": reopened.get("result_table"),
-                        "reopened_chart_spec": reopened.get("chart_spec"),
+                        "final_answer": reopened_state.get("final_answer", ""),
+                        "status": reopened_state.get("status", "completed"),
+                        "planner_used": reopened_state.get("planner_used"),
+                        "summary_text": reopened_state.get("summary_text"),
+                        "reopened_result_table": reopened_state.get("result_table"),
+                        "reopened_chart_spec": reopened_state.get("chart_spec"),
                     }
                     st.rerun()
+                else:
+                    st.error("Failed to reopen investigation: record not found, unauthorized, or corrupted.")
 
     if run_investigation:
+        if metadata and getattr(metadata, "dataset_id", None):
+            ds_check = repo.get_dataset(metadata.dataset_id, session_id=current_session_id)
+            if not ds_check:
+                st.error("Cannot run investigation: Dataset not found or inaccessible in current session.")
+                st.stop()
+
+        if metadata and getattr(metadata, "file_path", None):
+            file_p = Path(metadata.file_path)
+            if not file_p.exists() or not file_p.is_file():
+                st.error(
+                    f"Cannot run investigation: Underlying dataset file for '{metadata.name}' is missing from storage."
+                )
+                st.stop()
+
         with st.spinner("Planning and executing\u2026"):
             try:
                 # Reuse the app's cached repository and orchestrator so the routed
@@ -641,6 +712,7 @@ with tabs[0]:
                             evidence_store=_store,
                             planner_used=routing.planner_used,
                             summary_text=routing.result.plain_language_summary,
+                            session_id=current_session_id,
                         )
                     except Exception as exc:
                         logger.warning(f"Could not persist deep investigation: {exc}")
@@ -1277,7 +1349,9 @@ with tabs[4]:
     """, unsafe_allow_html=True)
 
     st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-    past_invs = repo.list_investigations(dataset_id=metadata.dataset_id)
+    past_invs = repo.list_investigations(
+        dataset_id=metadata.dataset_id, session_id=current_session_id
+    )
     if past_invs:
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown('<div class="section-label">Saved Investigations History</div>', unsafe_allow_html=True)

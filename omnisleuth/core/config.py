@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     max_investigation_depth: int = Field(default=3, description="Maximum hypothesis investigation depth")
     max_tool_calls: int = Field(default=10, description="Maximum allowlisted tool executions per investigation")
     max_retries: int = Field(default=2, description="Maximum retries for failed tool or agent steps")
+    max_upload_size_bytes: int = Field(
+        default=50 * 1024 * 1024,
+        description="Maximum allowed dataset upload size in bytes (default 50 MB)",
+    )
 
     # Storage Paths
     base_dir: Path = Field(default_factory=lambda: Path(__file__).resolve().parent.parent.parent)

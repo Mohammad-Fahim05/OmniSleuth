@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     row_count INTEGER NOT NULL,
     column_count INTEGER NOT NULL,
     duplicate_rows INTEGER NOT NULL,
+    session_id TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -35,9 +36,11 @@ CREATE TABLE IF NOT EXISTS investigations (
     status TEXT NOT NULL,
     plan_json TEXT,
     final_answer TEXT,
+    session_id TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (dataset_id) REFERENCES datasets (dataset_id)
 );
+
 CREATE TABLE IF NOT EXISTS tool_executions (
     execution_id TEXT PRIMARY KEY,
     investigation_id TEXT,
@@ -80,15 +83,20 @@ CREATE TABLE IF NOT EXISTS claims (
     validation_notes TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_datasets_session_id ON datasets(session_id);
+CREATE INDEX IF NOT EXISTS idx_investigations_session_id ON investigations(session_id);
 """
 
 
 class DatabaseManager:
     """Manages SQLite connections and schema migrations."""
 
-    # Additive columns only: reopening an investigation records the bounded result
-    # table and chart spec alongside the existing plan JSON.
+    # Additive columns only: supports session isolation and investigation enhancements
+    # without dropping or rewriting existing data.
     ADDITIVE_COLUMNS = (
+        ("datasets", "session_id", "TEXT"),
+        ("investigations", "session_id", "TEXT"),
         ("investigations", "result_table_json", "TEXT"),
         ("investigations", "chart_spec_json", "TEXT"),
         ("investigations", "planner_used", "TEXT"),
@@ -128,3 +136,7 @@ class DatabaseManager:
                     f"ALTER TABLE {table} ADD COLUMN {column} {column_type}"
                 )
                 logger.info(f"Added column {table}.{column} ({column_type})")
+
+        # Ensure indices exist on additive columns
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_session_id ON datasets(session_id);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_investigations_session_id ON investigations(session_id);")

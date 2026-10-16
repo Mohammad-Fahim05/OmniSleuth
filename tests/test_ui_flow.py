@@ -278,3 +278,26 @@ def test_no_key_deterministic_numeric_accuracy_and_llm_reporting(tmp_path):
     assert "Verified Analytical Claims" in final_answer
     assert "Tested Hypotheses" in final_answer
     assert "No unverified causal claims are asserted" in final_answer
+
+
+def test_ui_two_sessions_do_not_share_state():
+    """T-005.4: Two browser sessions maintain isolated session state and distinct session IDs."""
+    at1 = AppTest.from_file(APP_FILE, default_timeout=30)
+    at1.run()
+    assert len(at1.exception) == 0
+
+    at2 = AppTest.from_file(APP_FILE, default_timeout=30)
+    at2.run()
+    assert len(at2.exception) == 0
+
+    # Verify session_id is initialized and opaque in both sessions
+    sess_id_1 = at1.session_state.session_id
+    sess_id_2 = at2.session_state.session_id
+    assert sess_id_1.startswith("sess_")
+    assert sess_id_2.startswith("sess_")
+    assert sess_id_1 != sess_id_2
+
+    # Each session receives its own session-scoped dataset metadata
+    assert at1.session_state.metadata.dataset_id != at2.session_state.metadata.dataset_id
+    assert at1.session_state.metadata.session_id == sess_id_1
+    assert at2.session_state.metadata.session_id == sess_id_2

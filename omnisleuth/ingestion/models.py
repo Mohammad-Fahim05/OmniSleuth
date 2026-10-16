@@ -41,6 +41,7 @@ class DatasetMetadata(BaseModel):
     column_count: int = Field(ge=0, description="Total number of columns")
     duplicate_rows: int = Field(default=0, ge=0, description="Number of duplicate rows")
     columns: List[ColumnSchema] = Field(default_factory=list, description="Column schemas")
+    session_id: Optional[str] = Field(default=None, description="Owner session identifier")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Timestamp of ingestion")
 
     @property
