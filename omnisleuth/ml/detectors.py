@@ -202,8 +202,21 @@ def inject_synthetic_anomalies(
     Returns:
         Tuple of (df_with_anomalies, ground_truth_binary_array)
     """
+    if len(df) == 0:
+        return df.copy(), np.zeros(0, dtype=int)
+
+    missing_cols = [c for c in target_columns if c not in df.columns]
+    if missing_cols:
+        raise ToolExecutionError(f"Target columns not found in dataframe: {missing_cols}")
+
     np.random.seed(random_state)
     df_copy = df.copy()
+
+    # Safely convert integer target columns to float in df_copy to avoid pandas 2.x casting errors
+    for col in target_columns:
+        if pd.api.types.is_integer_dtype(df_copy[col].dtype):
+            df_copy[col] = df_copy[col].astype(float)
+
     n_rows = len(df_copy)
     n_anomalies = max(1, int(n_rows * anomaly_rate))
 
@@ -213,8 +226,9 @@ def inject_synthetic_anomalies(
 
     for idx in anomaly_indices:
         for col in target_columns:
-            std = float(df_copy[col].std()) if df_copy[col].std() > 0 else 1.0
-            mean = float(df_copy[col].mean())
+            s = df_copy[col].dropna()
+            std = float(s.std()) if len(s) > 1 and s.std() > 0 else 1.0
+            mean = float(s.mean()) if len(s) > 0 else 0.0
             # Inject extreme spike or drop
             multiplier = np.random.choice([-1, 1]) * magnitude_factor
             df_copy.loc[df_copy.index[idx], col] = round(mean + (multiplier * std), 2)
