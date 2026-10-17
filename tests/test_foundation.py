@@ -61,3 +61,33 @@ def test_exceptions_hierarchy():
     assert issubclass(ValidationError, OmniSleuthError)
     assert issubclass(ToolExecutionError, OmniSleuthError)
     assert issubclass(BoundedLimitExceededError, OmniSleuthError)
+
+
+def test_test_isolation_ignores_env_file(tmp_path, monkeypatch):
+    """Regression test (T-005S): proves fake keys in .env are ignored by test isolation."""
+    from omnisleuth.core.config import reset_settings
+
+    temp_env_dir = tmp_path / "env_isolation_test"
+    temp_env_dir.mkdir()
+    fake_env_file = temp_env_dir / ".env"
+    fake_env_file.write_text(
+        "OPENROUTER_API_KEY=sk-or-v1-FAKE\n"
+        "LLM_PROVIDER=openrouter\n"
+        "OPENAI_API_KEY=sk-FAKE\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(temp_env_dir)
+    reset_settings()
+
+    settings = get_settings()
+    assert settings.openrouter_api_key is None
+    assert settings.openai_api_key is None
+    assert settings.llm_provider == "fallback"
+
+    direct_settings = Settings()
+    assert direct_settings.openrouter_api_key is None
+
+    explicit_settings = Settings(_env_file=str(fake_env_file))
+    assert explicit_settings.openrouter_api_key == "sk-or-v1-FAKE"
+    assert explicit_settings.llm_provider == "openrouter"

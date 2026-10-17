@@ -1387,3 +1387,104 @@ def test_legacy_unassigned_records_remain_inaccessible_after_restart(tmp_path: P
     assert len(fresh_repo.list_investigations(session_id=active_session)) == 0
     assert fresh_repo.get_investigation("inv_legacy_reinit", session_id=active_session) is None
     assert fresh_repo.reconstruct_investigation_state("inv_legacy_reinit", session_id=active_session) is None
+
+
+def test_legacy_database_migration_ordering_and_session_indices(tmp_path: Path):
+    """Regression test: older SQLite databases without session_id migrate safely on startup."""
+    legacy_db_file = tmp_path / "pre_t005_legacy.db"
+
+    # 1. Create a pre-T005 database without session_id columns or session indices
+    with sqlite3.connect(str(legacy_db_file)) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE datasets (
+                dataset_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                version_hash TEXT NOT NULL,
+                row_count INTEGER NOT NULL,
+                column_count INTEGER NOT NULL,
+                duplicate_rows INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE investigations (
+                investigation_id TEXT PRIMARY KEY,
+                dataset_id TEXT NOT NULL,
+                question TEXT NOT NULL,
+                status TEXT NOT NULL,
+                plan_json TEXT,
+                final_answer TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (dataset_id) REFERENCES datasets (dataset_id)
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO datasets (dataset_id, name, file_path, version_hash, row_count, column_count, duplicate_rows)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("ds_pre_t005", "Pre-T005 Dataset", "data/pre.csv", "vpre", 50, 4, 0),
+        )
+        conn.execute(
+            """
+            INSERT INTO investigations (investigation_id, dataset_id, question, status, plan_json, final_answer)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("inv_pre_t005", "ds_pre_t005", "Legacy question?", "completed", "{}", "Legacy Answer"),
+        )
+        conn.commit()
+
+        # Confirm columns do NOT have session_id yet
+        cols_before_ds = {r[1] for r in conn.execute("PRAGMA table_info(datasets)").fetchall()}
+        cols_before_inv = {r[1] for r in conn.execute("PRAGMA table_info(investigations)").fetchall()}
+        assert "session_id" not in cols_before_ds
+        assert "session_id" not in cols_before_inv
+
+    # 2. Initialize DatabaseManager — this must migrate safely without OperationalError
+    db_man = DatabaseManager(db_path=str(legacy_db_file))
+
+    with db_man.get_connection() as conn:
+        cols_after_ds = {r[1] for r in conn.execute("PRAGMA table_info(datasets)").fetchall()}
+        cols_after_inv = {r[1] for r in conn.execute("PRAGMA table_info(investigations)").fetchall()}
+        assert "session_id" in cols_after_ds
+        assert "session_id" in cols_after_inv
+
+        # 3. Existing records survived migration intact
+        ds_row = conn.execute("SELECT dataset_id, name, session_id FROM datasets WHERE dataset_id = 'ds_pre_t005'").fetchone()
+        assert ds_row is not None
+        assert ds_row["dataset_id"] == "ds_pre_t005"
+        assert ds_row["name"] == "Pre-T005 Dataset"
+        assert ds_row["session_id"] is None
+
+        inv_row = conn.execute("SELECT investigation_id, question, session_id FROM investigations WHERE investigation_id = 'inv_pre_t005'").fetchone()
+        assert inv_row is not None
+        assert inv_row["investigation_id"] == "inv_pre_t005"
+        assert inv_row["question"] == "Legacy question?"
+        assert inv_row["session_id"] is None
+
+        # 4. Both session indexes were created
+        indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()}
+        assert "idx_datasets_session_id" in indexes
+        assert "idx_investigations_session_id" in indexes
+
+    # 5. Repeated initialization does not fail or duplicate columns
+    for _ in range(3):
+        reinit_man = DatabaseManager(db_path=str(legacy_db_file))
+        with reinit_man.get_connection() as conn:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(datasets)").fetchall()]
+            assert cols.count("session_id") == 1
+
+    # 6. Verify fresh database initializes with all tables, session_id, and indexes
+    fresh_db_file = tmp_path / "fresh_new.db"
+    fresh_man = DatabaseManager(db_path=str(fresh_db_file))
+    with fresh_man.get_connection() as conn:
+        cols_fresh_ds = {r[1] for r in conn.execute("PRAGMA table_info(datasets)").fetchall()}
+        cols_fresh_inv = {r[1] for r in conn.execute("PRAGMA table_info(investigations)").fetchall()}
+        assert "session_id" in cols_fresh_ds
+        assert "session_id" in cols_fresh_inv
+
+        fresh_indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()}
+        assert "idx_datasets_session_id" in fresh_indexes
+        assert "idx_investigations_session_id" in fresh_indexes

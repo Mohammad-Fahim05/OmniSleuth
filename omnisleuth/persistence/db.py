@@ -83,9 +83,6 @@ CREATE TABLE IF NOT EXISTS claims (
     validation_notes TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
-CREATE INDEX IF NOT EXISTS idx_datasets_session_id ON datasets(session_id);
-CREATE INDEX IF NOT EXISTS idx_investigations_session_id ON investigations(session_id);
 """
 
 
