@@ -778,7 +778,8 @@ class PlanExecutor:
             # Format Answer
             primary_metric = plan.metrics[0].column
             primary_agg = plan.metrics[0].agg.value
-            top_k = min(3, len(result_table))
+            max_display = 10
+            top_k = min(max_display, len(result_table))
             top_previews = []
             for i in range(top_k):
                 row = result_table[i]
@@ -787,8 +788,13 @@ class PlanExecutor:
                 formatted_val = f"${metric_val:,.2f}" if isinstance(metric_val, (int, float)) and "rev" in primary_metric.lower() else f"{metric_val:,.2f}" if isinstance(metric_val, (int, float)) else str(metric_val)
                 top_previews.append(f"{i+1}. {dim_str} ({formatted_val})")
 
+            if len(result_table) > top_k:
+                group_desc = f"showing top {top_k} of {len(result_table)} groups"
+            else:
+                group_desc = f"{len(result_table)} groups"
+
             statement = (
-                f"Breakdown of {primary_agg} {primary_metric} by {', '.join(plan.group_by)} ({len(result_table)} groups): "
+                f"Breakdown of {primary_agg} {primary_metric} by {', '.join(plan.group_by)} ({group_desc}): "
                 + ", ".join(top_previews) + "."
             )
 

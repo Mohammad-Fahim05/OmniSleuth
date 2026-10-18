@@ -30,6 +30,7 @@ from omnisleuth.llm.providers import BaseProvider
 from omnisleuth.nlq.context import build_schema_context
 from omnisleuth.nlq.executor import PlanExecutor
 from omnisleuth.nlq.llm_planner import LLMPlanner
+from omnisleuth.nlq.models import PlanIntent
 from omnisleuth.nlq.pipeline import AnalysisPipeline
 from omnisleuth.nlq.rule_planner import RulePlanner
 from omnisleuth.nlq.validator import PlanValidator
@@ -594,3 +595,54 @@ def test_plan_only_does_not_execute(dataset):
     plan = AnalysisPipeline(mode="rule").plan_only("What is total revenue by category?", schema_ctx)
     assert plan.group_by == ["category"]
     assert plan.planner == "deterministic"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 5: Safety net for rule planner disagreement (Test D)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_safety_net_prefers_rule_plan_for_contribution(dataset):
+    """Test D (T-003F Task 5): When LLM plans query for contribution question, rule plan is preferred and disagreement is recorded."""
+    df, metadata = dataset
+    question = "Which category contributed most to revenue?"
+
+    # LLM planned query limited to 1 group
+    llm_query_plan = {
+        "intent": "query",
+        "metrics": [{"column": "revenue", "agg": "sum"}],
+        "group_by": ["category"],
+        "limit": 1,
+        "confidence": 0.9,
+    }
+    pipeline, _ = _llm_pipeline([json.dumps(llm_query_plan)], mode="llm")
+
+    routing = pipeline.run(question, df, metadata)
+
+    # 1. Rule plan intent (CONTRIBUTION) is preferred over LLM intent (QUERY)
+    assert routing.result.plan.intent == PlanIntent.CONTRIBUTION
+    assert routing.result.plan.target_column == "revenue"
+    assert routing.result.plan.group_by == ["category"]
+
+    # 2. Disagreement note is recorded in the result
+    assert any("disagreement" in note.lower() for note in routing.result.limitations + routing.result.plan.assumptions)
+
+
+def test_safety_net_records_disagreement_without_overriding_other_intents(dataset):
+    """When rule plan differs but intent is not in {contribution, deep_investigation}, LLM plan is kept with disagreement note."""
+    df, metadata = dataset
+    question = "What is total revenue by category?"
+
+    # LLM plans TREND while rule planner plans QUERY
+    llm_trend_plan = {
+        "intent": "trend",
+        "metrics": [{"column": "revenue", "agg": "sum"}],
+        "group_by": ["category"],
+        "confidence": 0.9,
+    }
+    pipeline, _ = _llm_pipeline([json.dumps(llm_trend_plan)], mode="llm")
+
+    routing = pipeline.run(question, df, metadata)
+
+    # LLM plan intent kept because rule intent QUERY is not in {contribution, deep_investigation}
+    assert routing.result.plan.intent == PlanIntent.TREND
+    assert any("disagreement" in note.lower() for note in routing.result.limitations + routing.result.plan.assumptions)

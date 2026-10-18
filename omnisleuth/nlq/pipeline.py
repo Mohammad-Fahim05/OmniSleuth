@@ -238,12 +238,41 @@ class AnalysisPipeline:
         """LLM path with the explicitly configured fallback policy."""
         llm_configured = self._gateway_configured()
 
+        disagreement_note: Optional[str] = None
         try:
             plan = self.llm_planner.plan(question, schema_ctx, history_ctx)
             planner_used = MODE_LLM
             fallback_used = False
             fallback_reason: Optional[str] = None
+
+            # Optional safety net: when the rule planner returns a confident plan
+            # whose intent differs from the LLM plan for the same question, record
+            # a disagreement note in the result and prefer the rule plan for intents
+            # in {contribution, deep_investigation}.
+            try:
+                rule_plan = self.rule_planner.plan(question, schema_ctx, history_ctx)
+                if (
+                    rule_plan
+                    and rule_plan.intent != PlanIntent.UNSUPPORTED
+                    and rule_plan.confidence >= 0.7
+                    and rule_plan.intent != plan.intent
+                ):
+                    disagreement_note = (
+                        f"Disagreement note: Rule planner planned intent '{rule_plan.intent.value}' "
+                        f"(confidence {rule_plan.confidence:.2f}) while LLM planned '{plan.intent.value}'."
+                    )
+                    if rule_plan.intent in (PlanIntent.CONTRIBUTION, PlanIntent.DEEP_INVESTIGATION):
+                        plan = rule_plan
+                        if disagreement_note not in plan.assumptions:
+                            plan.assumptions.append(disagreement_note)
+                    else:
+                        if disagreement_note not in plan.assumptions:
+                            plan.assumptions.append(disagreement_note)
+            except Exception as e:
+                logger.debug(f"Safety net rule planner check failed: {e}")
+
         except LLMPlanningError as exc:
+            disagreement_note = None
             reason = self._sanitized_reason(exc)
             logger.warning(f"LLM planning failed [{getattr(exc, 'category', 'unknown')}]: {reason}")
 
@@ -276,6 +305,8 @@ class AnalysisPipeline:
 
         validated = self.plan_validator.validate(plan, schema_ctx)
         result = self.executor.execute(validated, df, metadata, question)
+        if disagreement_note and disagreement_note not in result.limitations:
+            result.limitations.append(disagreement_note)
 
         return self._finish(
             question=question,
@@ -330,6 +361,27 @@ class AnalysisPipeline:
         if self.mode == MODE_LLM:
             try:
                 plan = self.llm_planner.plan(question, schema_ctx, history)
+                try:
+                    rule_plan = self.rule_planner.plan(question, schema_ctx, history)
+                    if (
+                        rule_plan
+                        and rule_plan.intent != PlanIntent.UNSUPPORTED
+                        and rule_plan.confidence >= 0.7
+                        and rule_plan.intent != plan.intent
+                    ):
+                        note = (
+                            f"Disagreement note: Rule planner planned intent '{rule_plan.intent.value}' "
+                            f"(confidence {rule_plan.confidence:.2f}) while LLM planned '{plan.intent.value}'."
+                        )
+                        if rule_plan.intent in (PlanIntent.CONTRIBUTION, PlanIntent.DEEP_INVESTIGATION):
+                            plan = rule_plan
+                            if note not in plan.assumptions:
+                                plan.assumptions.append(note)
+                        else:
+                            if note not in plan.assumptions:
+                                plan.assumptions.append(note)
+                except Exception as e:
+                    logger.debug(f"Safety net rule planner check failed in plan_only: {e}")
             except LLMPlanningError:
                 if self.fallback == FALLBACK_FAIL:
                     raise

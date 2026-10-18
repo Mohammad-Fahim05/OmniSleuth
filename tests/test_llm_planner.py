@@ -813,3 +813,165 @@ def test_non_json_response_fails_after_repair(schema_ctx):
 
     assert "no JSON object" in excinfo.value.errors[0] or "not valid JSON" in excinfo.value.errors[0]
     assert provider.calls == 2
+
+
+def test_why_cause_override_replaces_trend_with_deep_investigation(schema_ctx):
+    """Test A (T-003F Task 1): Causal questions override trend/query/period_comparison with deep_investigation."""
+    trend_payload = json.dumps({
+        "intent": "trend",
+        "metrics": [{"column": "revenue", "agg": "sum"}],
+        "group_by": [],
+        "filters": [],
+        "confidence": 0.9,
+    })
+    planner, provider = build_planner([trend_payload])
+    plan = planner.plan("Why did revenue decline in March?", schema_ctx)
+
+    assert plan.intent == PlanIntent.DEEP_INVESTIGATION
+    assert any("deep_investigation" in a.lower() or "caus" in a.lower() for a in plan.assumptions)
+
+
+@pytest.mark.parametrize(
+    "question,intent",
+    [
+        ("What was the reason for the drop in sales?", "trend"),
+        ("What caused revenue to fall?", "query"),
+        ("Explain the difference between Q1 and Q2", "period_comparison"),
+        ("What drove the decline in March?", "query"),
+        ("Is the decline due to lower units sold?", "query"),
+    ],
+)
+def test_why_cause_override_all_cause_words_and_intents(schema_ctx, question, intent):
+    """Test A parameterized (T-003F Task 1): All specified cause words override trend/query/period_comparison."""
+    payload = json.dumps({
+        "intent": intent,
+        "metrics": [{"column": "revenue", "agg": "sum"}],
+        "group_by": [],
+        "filters": [],
+        "confidence": 0.9,
+    })
+    planner, _ = build_planner([payload])
+    plan = planner.plan(question, schema_ctx)
+
+    assert plan.intent == PlanIntent.DEEP_INVESTIGATION
+    assert any("deep_investigation" in a.lower() or "caus" in a.lower() for a in plan.assumptions)
+
+
+def test_why_cause_override_does_not_affect_non_causal_trend(schema_ctx):
+    """Non-causal questions retain their normal trend/query intent."""
+    trend_payload = json.dumps({
+        "intent": "trend",
+        "metrics": [{"column": "revenue", "agg": "sum"}],
+        "group_by": [],
+        "filters": [],
+        "confidence": 0.9,
+    })
+    planner, _ = build_planner([trend_payload])
+    plan = planner.plan("What is the monthly revenue trend?", schema_ctx)
+
+    assert plan.intent == PlanIntent.TREND
+
+
+def test_followup_resolves_to_previous_plan(schema_ctx):
+    """Test B resolved (T-003F Task 2): intent=followup inherits metrics and filters, applies new group_by."""
+    history_ctx = [
+        {
+            "question": "Compare revenue in January vs February",
+            "intent": "period_comparison",
+            "metrics": [{"column": "revenue", "agg": "sum"}],
+            "filters": [{"column": "category", "op": "eq", "value": "Electronics"}],
+            "group_by": [],
+        }
+    ]
+    followup_payload = json.dumps({
+        "intent": "followup",
+        "followup_of": "Compare revenue in January vs February",
+        "group_by": ["region"],
+        "metrics": [],
+        "filters": [],
+        "confidence": 0.9,
+    })
+    planner, _ = build_planner([followup_payload])
+    plan = planner.plan("now by region", schema_ctx, history_ctx=history_ctx)
+
+    assert plan.intent == PlanIntent.QUERY
+    assert len(plan.metrics) == 1
+    assert plan.metrics[0].column == "revenue"
+    assert plan.group_by == ["region"]
+    assert len(plan.filters) == 1
+    assert plan.filters[0].column == "category"
+    assert plan.needs_clarification is None
+
+
+def test_followup_unresolved_returns_needs_clarification(schema_ctx):
+    """Test B unresolved (T-003F Task 2): intent=followup without matching referent returns needs_clarification."""
+    # 1. Empty history
+    followup_payload = json.dumps({
+        "intent": "followup",
+        "followup_of": "Unknown previous question",
+        "group_by": ["region"],
+        "metrics": [],
+        "filters": [],
+        "confidence": 0.9,
+    })
+    planner, _ = build_planner([followup_payload])
+    plan_empty = planner.plan("now by region", schema_ctx, history_ctx=[])
+    assert plan_empty.needs_clarification is not None
+    assert "clarification" in plan_empty.needs_clarification.lower() or "not" in plan_empty.needs_clarification.lower()
+
+    # 2. Non-matching history
+    planner2, _ = build_planner([followup_payload])
+    plan_mismatch = planner2.plan(
+        "now by region",
+        schema_ctx,
+        history_ctx=[{"question": "Something completely different", "metrics": []}],
+    )
+    assert plan_mismatch.needs_clarification is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 4: Outbound prompt rules
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_outbound_prompt_contains_planning_rules_and_no_raw_rows_or_key(schema_ctx):
+    """Test (T-003F Task 4): Outbound prompt contains semantic rules, no raw rows, and no key."""
+    planner, provider = build_planner([json.dumps(VALID_PLAN)])
+    planner.plan("What is total revenue by category?", schema_ctx)
+
+    prompt = last_prompt_text(provider)
+
+    # 1. Semantic rules in outbound prompt
+    assert '"per <identifier>" is not a group-by' in prompt
+    assert '"which X contributed most" is the contribution intent' in prompt
+    assert "why-questions are deep_investigation" in prompt
+
+    # 2. No raw rows in prompt
+    assert '"rows"' not in prompt
+    assert "<raw_rows>" not in prompt
+
+    # 3. No secrets or keys in prompt
+    assert TEST_API_KEY not in prompt
+    assert "sk-" not in prompt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Defect A: Legitimate date grouping for trends in LLM planning
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_llm_planner_accepts_trend_plan_with_order_date_group_by(schema_ctx):
+    """Defect A: LLM emitting a trend plan with group_by=['order_date'] is accepted without fallback."""
+    trend_payload = {
+        "intent": "trend",
+        "metrics": [{"column": "revenue", "agg": "sum"}],
+        "group_by": ["order_date"],
+        "confidence": 0.9,
+    }
+    planner, provider = build_planner([json.dumps(trend_payload)])
+    plan = planner.plan("What is the monthly revenue trend?", schema_ctx)
+
+    assert plan.intent == PlanIntent.TREND
+    assert plan.planner == "llm"
+    assert plan.unsupported_reason is None
+    assert plan.time is not None
+    assert plan.time.date_column == "order_date"
+    assert plan.time.grain.value == "month"

@@ -382,3 +382,69 @@ def test_claim_validator_rejects_wrong_number(test_dataset):
     res_fake = validator.validate_all([fake_claim], store)
     assert res_fake[0].status == ClaimStatus.UNSUPPORTED
     assert len(res_fake[0].validation_explanation or '') > 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Defect B: Regional follow-up displays all four groups
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_four_group_regional_query_displays_all_four_regions(test_dataset):
+    """Defect B: Four-group regional query displays all four regions without omitting one."""
+    df, metadata, schema_ctx = test_dataset
+    executor = PlanExecutor()
+
+    from omnisleuth.nlq.models import MetricSpec, MetricAgg
+    plan = AnalysisPlan(
+        intent=PlanIntent.QUERY,
+        metrics=[MetricSpec(column="revenue", agg=MetricAgg.SUM)],
+        group_by=["region"],
+    )
+
+    result = executor.execute(plan, df, metadata, "now by region")
+
+    # 1. All four region rows exist in the structured result
+    assert result.status == "answered"
+    assert len(result.result_table) == 4
+    result_regions = {r["region"] for r in result.result_table}
+    assert result_regions == {"North", "South", "East", "West"}
+
+    # 2. The answer accurately lists all four regions and their totals
+    for reg in ("North", "South", "East", "West"):
+        assert reg in result.answer, f"Region '{reg}' was omitted from the answer: {result.answer}"
+
+    # 3. The reported group count agrees with what the answer claims to display
+    assert "(4 groups):" in result.answer
+    assert "4. " in result.answer, f"Fourth group item number missing from answer: {result.answer}"
+
+
+def test_group_by_with_many_groups_explicitly_notes_subset():
+    """Defect B: When groups exceed display limit, answer explicitly states subset."""
+    df = pd.DataFrame({
+        "item": [f"Item_{i:02d}" for i in range(15)],
+        "val": [10.0 * (i + 1) for i in range(15)],
+    })
+    metadata = DatasetMetadata(
+        dataset_id="ds_many",
+        name="Many Items",
+        file_path="many.csv",
+        version_hash="hash_many",
+        row_count=len(df),
+        column_count=len(df.columns),
+        columns=[
+            ColumnSchema(name="item", data_type=ColumnType.CATEGORICAL, dtype="object", unique_count=15),
+            ColumnSchema(name="val", data_type=ColumnType.NUMERIC, dtype="float64", unique_count=15),
+        ],
+    )
+    executor = PlanExecutor()
+    from omnisleuth.nlq.models import MetricSpec, MetricAgg
+    plan = AnalysisPlan(
+        intent=PlanIntent.QUERY,
+        metrics=[MetricSpec(column="val", agg=MetricAgg.SUM)],
+        group_by=["item"],
+    )
+    result = executor.execute(plan, df, metadata)
+    assert result.status == "answered"
+    assert len(result.result_table) == 15
+    assert "showing top 10 of 15 groups" in result.answer
+    assert "10. " in result.answer
+    assert "11. " not in result.answer

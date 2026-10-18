@@ -12,6 +12,7 @@ from omnisleuth.evidence.models import (
 )
 from omnisleuth.evidence.store import EvidenceStore
 from omnisleuth.evidence.validator import ClaimValidator, ValidationResult
+from omnisleuth.evidence.grounding import check_grounding, extract_currency_and_percentages
 
 __all__ = [
     "EvidenceType",
@@ -25,4 +26,6 @@ __all__ = [
     "EvidenceStore",
     "ClaimValidator",
     "ValidationResult",
+    "check_grounding",
+    "extract_currency_and_percentages",
 ]

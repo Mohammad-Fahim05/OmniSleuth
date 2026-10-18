@@ -26,9 +26,12 @@ from omnisleuth.nlq.models import (
     AnalysisPlan,
     ChartType,
     FilterOp,
+    FilterSpec,
     MetricAgg,
+    MetricSpec,
     PlanIntent,
     TimeGrain,
+    TimeSpec,
 )
 from omnisleuth.nlq.planner import Planner
 from omnisleuth.nlq.rule_planner import RulePlanner
@@ -68,6 +71,10 @@ _PROFILE_CLOSE = "</dataset_profile>"
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _CODE_FENCE_RE = re.compile(r"^\s*```[a-zA-Z0-9_-]*\s*|\s*```\s*$", re.MULTILINE)
+_CAUSE_WORDS_PATTERN = re.compile(
+    r"\b(why|reason|reasons|cause|causes|caused|explain|explains|explained|drove|due\s+to)\b",
+    re.IGNORECASE,
+)
 
 
 class LLMPlanningError(OmniSleuthError):
@@ -346,6 +353,21 @@ class LLMPlanner:
                 logger.warning(f"LLM plan attempt {attempt + 1} failed schema/injection validation: {exc}")
                 continue
 
+            # Followup handling: resolve followup plans against history_ctx (T-003F Task 2)
+            if plan.intent == PlanIntent.FOLLOWUP:
+                plan = self._resolve_llm_followup(plan, history_ctx)
+
+            # Deterministic why/cause override: causal questions get deep_investigation (T-003F Task 1)
+            if _CAUSE_WORDS_PATTERN.search(safe_question) and plan.intent in (
+                PlanIntent.TREND,
+                PlanIntent.QUERY,
+                PlanIntent.PERIOD_COMPARISON,
+            ):
+                plan.intent = PlanIntent.DEEP_INVESTIGATION
+                plan.assumptions.append(
+                    "Causal question detected; overriding LLM intent to deep_investigation."
+                )
+
             model_declared_unsupported = plan.intent in (
                 PlanIntent.UNSUPPORTED,
                 PlanIntent.GENERAL_KNOWLEDGE,
@@ -388,6 +410,108 @@ class LLMPlanner:
             logger.info(f"LLM planning failed ({exc.category}); delegating to RulePlanner: {exc}")
             return self.rule_planner.plan(question, schema_ctx, history_ctx)
 
+    def _resolve_llm_followup(
+        self,
+        plan: AnalysisPlan,
+        history_ctx: Optional[List[Dict[str, Any]]],
+    ) -> AnalysisPlan:
+        """Resolve a follow-up plan against conversation history.
+
+        When intent is followup and followup_of resolves to a previous plan in history_ctx,
+        build a query plan that inherits the previous metrics and filters and applies the new group_by.
+        If it does not resolve, return needs_clarification.
+        """
+        referent = self._find_history_referent(plan.followup_of, history_ctx)
+        if referent is None:
+            return AnalysisPlan(
+                intent=PlanIntent.QUERY,
+                confidence=0.0,
+                needs_clarification=(
+                    f"Needs clarification: follow-up question refers to '{plan.followup_of or 'an earlier question'}', "
+                    "but no matching question was found in recent conversation history. "
+                    "Please state your question explicitly."
+                ),
+                followup_of=plan.followup_of,
+                group_by=list(plan.group_by),
+                planner=self.planner_name,
+            )
+
+        metrics = [
+            MetricSpec(column=m["column"], agg=MetricAgg(m.get("agg", "sum")))
+            for m in referent.get("metrics", [])
+            if isinstance(m, dict) and "column" in m
+        ] or list(plan.metrics)
+
+        filters = [
+            FilterSpec(column=f["column"], op=FilterOp(f.get("op", "eq")), value=f.get("value"))
+            for f in referent.get("filters", [])
+            if isinstance(f, dict) and "column" in f and "op" in f
+        ] or list(plan.filters)
+
+        time_spec = None
+        if referent.get("time") and isinstance(referent["time"], dict):
+            t = referent["time"]
+            if t.get("date_column"):
+                time_spec = TimeSpec(
+                    date_column=t["date_column"],
+                    grain=TimeGrain(t.get("grain", "month")),
+                    start=t.get("start"),
+                    end=t.get("end"),
+                )
+        elif plan.time:
+            time_spec = plan.time
+
+        return AnalysisPlan(
+            intent=PlanIntent.QUERY,
+            metrics=metrics,
+            group_by=list(plan.group_by),
+            filters=filters,
+            time=time_spec,
+            chart=plan.chart,
+            sort=plan.sort,
+            limit=plan.limit,
+            followup_of=plan.followup_of or referent.get("question"),
+            confidence=plan.confidence,
+            assumptions=list(plan.assumptions) + [
+                f"Inherited metrics and filters from previous question: '{referent.get('question', '')}'."
+            ],
+            planner=self.planner_name,
+        )
+
+    @staticmethod
+    def _find_history_referent(
+        followup_of: Optional[str],
+        history_ctx: Optional[List[Dict[str, Any]]],
+    ) -> Optional[Dict[str, Any]]:
+        if not history_ctx:
+            return None
+
+        if not followup_of or not followup_of.strip():
+            for entry in reversed(history_ctx):
+                if isinstance(entry, dict) and entry.get("metrics"):
+                    return entry
+            return None
+
+        target = followup_of.strip().lower()
+        # 1. Exact match on question
+        for entry in reversed(history_ctx):
+            if not isinstance(entry, dict):
+                continue
+            q = entry.get("question", "").strip().lower()
+            if q == target:
+                return entry
+
+        # 2. Substring match
+        for entry in reversed(history_ctx):
+            if not isinstance(entry, dict):
+                continue
+            q = entry.get("question", "").strip().lower()
+            if target in q or q in target:
+                return entry
+
+        return None
+
+
     # ── Prompt construction ───────────────────────────────────────────────────
 
     def _build_prompt(
@@ -428,10 +552,18 @@ class LLMPlanner:
             "Never emit Python, SQL, shell commands, or explanation text."
         )
 
+        planning_rules = (
+            "PLANNING_RULES:\n"
+            '- "per <identifier>" is not a group-by (e.g. "average units_sold per order" means compute mean of units_sold, not group by order_id).\n'
+            '- "which X contributed most" is the contribution intent (do not plan a query limited to 1 group).\n'
+            '- why-questions are deep_investigation (e.g. "why did revenue decline in March?", "what drove the drop").'
+        )
+
         user_prompt = (
             f"{_QUESTION_OPEN}\n{safe_question}\n{_QUESTION_CLOSE}\n\n"
             f"{_PROFILE_OPEN}\n{json.dumps(profile, separators=(',', ':'))}\n{_PROFILE_CLOSE}\n"
             f"{history_block}\n\n"
+            f"{planning_rules}\n\n"
             f"ALLOWED_VOCABULARY:\n{json.dumps(vocabulary, separators=(',', ':'))}\n\n"
             "PLAN_JSON_SCHEMA (unknown fields are rejected):\n"
             f"{json.dumps(build_plan_json_schema(), separators=(',', ':'))}\n\n"

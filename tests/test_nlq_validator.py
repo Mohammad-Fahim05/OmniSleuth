@@ -276,3 +276,147 @@ def test_unknown_fields_rejected():
             value=100,
             injected_sql="SELECT * FROM users",
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test C: PlanValidator rejects identifier or high-cardinality group_by columns
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_reject_group_by_identifier_column(sample_schema_ctx):
+    """Test C: PlanValidator rejects group_by on columns marked as identifier."""
+    validator = PlanValidator()
+    plan = AnalysisPlan(
+        intent=PlanIntent.QUERY,
+        metrics=[MetricSpec(column="revenue", agg=MetricAgg.MEAN)],
+        group_by=["order_id"],
+    )
+
+    validated = validator.validate(plan, sample_schema_ctx)
+    assert validated.intent == PlanIntent.UNSUPPORTED
+    assert "order_id" in validated.unsupported_reason
+    assert "identifier" in validated.unsupported_reason.lower()
+
+
+def test_reject_group_by_exceeds_cardinality_limit(sample_schema_ctx):
+    """Test C: PlanValidator rejects group_by on columns exceeding default cardinality limit (30)."""
+    # Add a categorical column with 50 distinct values
+    sample_schema_ctx.columns["city"] = ColumnContext(
+        name="city",
+        data_type="categorical",
+        dtype="object",
+        unique_count=50,
+    )
+    validator = PlanValidator()
+    plan = AnalysisPlan(
+        intent=PlanIntent.QUERY,
+        metrics=[MetricSpec(column="revenue", agg=MetricAgg.SUM)],
+        group_by=["city"],
+    )
+
+    validated = validator.validate(plan, sample_schema_ctx)
+    assert validated.intent == PlanIntent.UNSUPPORTED
+    assert "city" in validated.unsupported_reason
+    assert "cardinality" in validated.unsupported_reason.lower() or "distinct" in validated.unsupported_reason.lower()
+    assert "30" in validated.unsupported_reason
+
+
+def test_configurable_group_by_cardinality(sample_schema_ctx):
+    """Configurable max_group_by_cardinality allows tightening or loosening the limit."""
+    # region has 25 unique values
+    strict_validator = PlanValidator(max_group_by_cardinality=20)
+    lenient_validator = PlanValidator(max_group_by_cardinality=50)
+
+    plan = AnalysisPlan(
+        intent=PlanIntent.QUERY,
+        metrics=[MetricSpec(column="revenue", agg=MetricAgg.SUM)],
+        group_by=["region"],
+    )
+
+    rejected = strict_validator.validate(plan, sample_schema_ctx)
+    assert rejected.intent == PlanIntent.UNSUPPORTED
+    assert "region" in rejected.unsupported_reason
+    assert "20" in rejected.unsupported_reason
+
+    accepted = lenient_validator.validate(plan, sample_schema_ctx)
+    assert accepted.intent == PlanIntent.QUERY
+    assert accepted.unsupported_reason is None
+
+
+def test_legitimate_categorical_group_by_allowed(sample_schema_ctx):
+    """Legitimate categorical columns with cardinality within limits remain valid."""
+    validator = PlanValidator()
+    plan = AnalysisPlan(
+        intent=PlanIntent.QUERY,
+        metrics=[MetricSpec(column="revenue", agg=MetricAgg.SUM)],
+        group_by=["category"],
+    )
+
+    validated = validator.validate(plan, sample_schema_ctx)
+    assert validated.intent == PlanIntent.QUERY
+    assert validated.unsupported_reason is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Defect A: Legitimate date grouping for trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_legitimate_monthly_trend_group_by_order_date_passes(sample_schema_ctx):
+    """Defect A: A monthly trend plan grouping by order_date buckets into 12 months (<= 30) and passes."""
+    validator = PlanValidator()
+    plan = AnalysisPlan(
+        intent=PlanIntent.TREND,
+        metrics=[MetricSpec(column="revenue", agg=MetricAgg.SUM)],
+        group_by=["order_date"],
+        time=TimeSpec(date_column="order_date", grain=TimeGrain.MONTH),
+    )
+
+    validated = validator.validate(plan, sample_schema_ctx)
+    assert validated.intent == PlanIntent.TREND
+    assert validated.unsupported_reason is None
+
+
+def test_legitimate_monthly_trend_without_explicit_timespec_passes(sample_schema_ctx):
+    """Defect A: A trend plan with group_by=['order_date'] defaults to monthly bucketing and passes."""
+    validator = PlanValidator()
+    plan = AnalysisPlan(
+        intent=PlanIntent.TREND,
+        metrics=[MetricSpec(column="revenue", agg=MetricAgg.SUM)],
+        group_by=["order_date"],
+    )
+
+    validated = validator.validate(plan, sample_schema_ctx)
+    assert validated.intent == PlanIntent.TREND
+    assert validated.unsupported_reason is None
+    assert validated.time is not None
+    assert validated.time.date_column == "order_date"
+    assert validated.time.grain == TimeGrain.MONTH
+
+
+def test_raw_date_grouping_in_query_plan_rejected(sample_schema_ctx):
+    """Defect A: Raw-date grouping in a query plan (365 distinct dates > 30) is rejected."""
+    validator = PlanValidator()
+    plan = AnalysisPlan(
+        intent=PlanIntent.QUERY,
+        metrics=[MetricSpec(column="revenue", agg=MetricAgg.SUM)],
+        group_by=["order_date"],
+    )
+
+    validated = validator.validate(plan, sample_schema_ctx)
+    assert validated.intent == PlanIntent.UNSUPPORTED
+    assert "order_date" in validated.unsupported_reason
+    assert "cardinality" in validated.unsupported_reason.lower() or "distinct" in validated.unsupported_reason.lower()
+
+
+def test_daily_trend_exceeding_cardinality_rejected(sample_schema_ctx):
+    """Defect A: Daily trend plan produces 365 daily groups (> 30) and is rejected as unbounded raw grouping."""
+    validator = PlanValidator()
+    plan = AnalysisPlan(
+        intent=PlanIntent.TREND,
+        metrics=[MetricSpec(column="revenue", agg=MetricAgg.SUM)],
+        group_by=["order_date"],
+        time=TimeSpec(date_column="order_date", grain=TimeGrain.DAY),
+    )
+
+    validated = validator.validate(plan, sample_schema_ctx)
+    assert validated.intent == PlanIntent.UNSUPPORTED
+    assert "order_date" in validated.unsupported_reason

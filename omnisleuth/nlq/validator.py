@@ -2,13 +2,15 @@
 
 from typing import List, Optional, Set, Tuple
 import pandas as pd
-from omnisleuth.nlq.context import SchemaContext
+from omnisleuth.nlq.context import ColumnContext, SchemaContext
 from omnisleuth.nlq.models import (
     AnalysisPlan,
     ChartType,
     FilterOp,
     MetricAgg,
     PlanIntent,
+    TimeGrain,
+    TimeSpec,
 )
 
 
@@ -23,9 +25,15 @@ class PlanValidationError(Exception):
 class PlanValidator:
     """Validates AnalysisPlan against SchemaContext without hallucinating or defaulting."""
 
-    def __init__(self, max_limit: int = 50, max_in_list_size: int = 50):
+    def __init__(
+        self,
+        max_limit: int = 50,
+        max_in_list_size: int = 50,
+        max_group_by_cardinality: int = 30,
+    ):
         self.max_limit = max_limit
         self.max_in_list_size = max_in_list_size
+        self.max_group_by_cardinality = max_group_by_cardinality
 
     def validate(self, plan: AnalysisPlan, schema_ctx: SchemaContext) -> AnalysisPlan:
         """Validate an AnalysisPlan against SchemaContext.
@@ -51,6 +59,7 @@ class PlanValidator:
         try:
             self._validate_columns_exist(plan, schema_ctx)
             self._validate_metric_aggregations(plan, schema_ctx)
+            self._validate_group_by(plan, schema_ctx)
             self._validate_filters(plan, schema_ctx)
             self._validate_time_spec(plan, schema_ctx)
             self._validate_chart_compatibility(plan, schema_ctx)
@@ -71,6 +80,7 @@ class PlanValidator:
         try:
             self._validate_columns_exist(plan, schema_ctx)
             self._validate_metric_aggregations(plan, schema_ctx)
+            self._validate_group_by(plan, schema_ctx)
             self._validate_filters(plan, schema_ctx)
             self._validate_time_spec(plan, schema_ctx)
             self._validate_chart_compatibility(plan, schema_ctx)
@@ -170,6 +180,92 @@ class PlanValidator:
                         f"Cannot compute {m.agg.value} of non-ordered column '{m.column}' (detected type: {col_ctx.data_type}).",
                     )
 
+    def _estimate_bucketed_date_cardinality(
+        self,
+        grain: TimeGrain,
+        col_ctx: ColumnContext,
+        schema_ctx: SchemaContext,
+        time_spec: Optional[TimeSpec] = None,
+    ) -> int:
+        """Estimate the number of discrete time buckets for a date column."""
+        min_d = (time_spec.start if time_spec and time_spec.start else None) or schema_ctx.min_date or col_ctx.min_value
+        max_d = (time_spec.end if time_spec and time_spec.end else None) or schema_ctx.max_date or col_ctx.max_value
+
+        if grain == TimeGrain.DAY:
+            if min_d and max_d:
+                try:
+                    dt_min = pd.to_datetime(min_d)
+                    dt_max = pd.to_datetime(max_d)
+                    return max(1, (dt_max - dt_min).days + 1)
+                except Exception:
+                    pass
+            return col_ctx.unique_count or 0
+
+        if min_d and max_d:
+            try:
+                dt_min = pd.to_datetime(min_d)
+                dt_max = pd.to_datetime(max_d)
+                if grain == TimeGrain.MONTH:
+                    return max(1, (dt_max.year - dt_min.year) * 12 + (dt_max.month - dt_min.month) + 1)
+                elif grain == TimeGrain.QUARTER:
+                    q_min = (dt_min.month - 1) // 3
+                    q_max = (dt_max.month - 1) // 3
+                    return max(1, (dt_max.year - dt_min.year) * 4 + (q_max - q_min) + 1)
+                elif grain == TimeGrain.YEAR:
+                    return max(1, dt_max.year - dt_min.year + 1)
+                elif grain == TimeGrain.WEEK:
+                    days = (dt_max - dt_min).days
+                    return max(1, days // 7 + 1)
+            except Exception:
+                pass
+
+        raw = col_ctx.unique_count or 0
+        if grain == TimeGrain.MONTH:
+            return max(1, (raw + 27) // 28)
+        elif grain == TimeGrain.QUARTER:
+            return max(1, (raw + 89) // 90)
+        elif grain == TimeGrain.YEAR:
+            return max(1, (raw + 364) // 365)
+        elif grain == TimeGrain.WEEK:
+            return max(1, (raw + 6) // 7)
+
+        return raw
+
+    def _validate_group_by(self, plan: AnalysisPlan, schema_ctx: SchemaContext) -> None:
+        """Reject group-by columns marked as identifier or exceeding max cardinality."""
+        for g in plan.group_by:
+            col_ctx = schema_ctx.columns.get(g)
+            if not col_ctx:
+                continue
+
+            if str(col_ctx.data_type).lower() == "identifier":
+                raise PlanValidationError(
+                    f"Group-by column '{g}' is an identifier",
+                    f"Column '{g}' is marked as an identifier and cannot be used as a group-by dimension.",
+                )
+
+            is_date_col = (str(col_ctx.data_type).lower() == "datetime") or (g in schema_ctx.date_columns)
+
+            if is_date_col and plan.intent == PlanIntent.TREND:
+                # In trend plans, date columns are bucketed into time periods (e.g., months/quarters),
+                # not grouped by raw timestamps. Estimate bucketed period cardinality.
+                grain = plan.time.grain if (plan.time and plan.time.grain) else TimeGrain.MONTH
+                cardinality = self._estimate_bucketed_date_cardinality(grain, col_ctx, schema_ctx, plan.time)
+                # If plan has no time specification, populate it with standard monthly bucketing
+                if plan.time is None:
+                    plan.time = TimeSpec(date_column=g, grain=grain)
+                elif not plan.time.date_column:
+                    plan.time.date_column = g
+            else:
+                cardinality = col_ctx.unique_count or 0
+
+            if cardinality > self.max_group_by_cardinality:
+                raise PlanValidationError(
+                    f"Group-by column '{g}' exceeds cardinality limit",
+                    f"Group-by column '{g}' has {cardinality} distinct values, "
+                    f"exceeding the maximum allowed cardinality of {self.max_group_by_cardinality}.",
+                )
+
     def _validate_filters(self, plan: AnalysisPlan, schema_ctx: SchemaContext) -> None:
         """Validate filter operators, value types, and bounds."""
         for f in plan.filters:
@@ -268,6 +364,18 @@ class PlanValidator:
                 raise
             except Exception:
                 pass
+
+        # Ensure trend plans do not exceed maximum bucket cardinality
+        if plan.intent == PlanIntent.TREND and plan.time:
+            col_ctx = schema_ctx.columns.get(plan.time.date_column)
+            if col_ctx:
+                cardinality = self._estimate_bucketed_date_cardinality(plan.time.grain, col_ctx, schema_ctx, plan.time)
+                if cardinality > self.max_group_by_cardinality:
+                    raise PlanValidationError(
+                        f"Trend time grain '{plan.time.grain.value}' exceeds cardinality limit",
+                        f"Time grain '{plan.time.grain.value}' on column '{plan.time.date_column}' produces ~{cardinality} buckets, "
+                        f"exceeding the maximum allowed cardinality of {self.max_group_by_cardinality}.",
+                    )
 
         # Validate discrete comparison periods (period_a and period_b)
         for p_name, p_spec in [("period_a", plan.period_a), ("period_b", plan.period_b)]:

@@ -421,3 +421,305 @@ def test_cache_key_includes_provider_identity():
     gateway.generate(req_b)
 
     assert provider.calls == 2  # provider identity is part of the cache key
+
+
+def test_audit_live_smoke_grounded_currency_and_percentages_only():
+    """Test (T-003F Task 6): audit/live_smoke.py extracts only currency and percentage values."""
+    from omnisleuth.evidence.grounding import extract_currency_and_percentages
+
+    text = (
+        "In 'category', 'Electronics' ranked #1 and contributed the largest share to total revenue "
+        "with 45.2% ($12,345.67 of $27,313.44 total) across 50 orders with -3.5% discount."
+    )
+    numbers = extract_currency_and_percentages(text)
+
+    # Must contain currency and percentage values
+    assert 12345.67 in numbers
+    assert 27313.44 in numbers
+    assert 45.2 in numbers
+    assert -3.5 in numbers
+
+    # Must NOT contain ranks (1) or counts (50)
+    assert 1.0 not in numbers
+    assert 50.0 not in numbers
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Defect C: Deep-investigation grounding checker tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_grounding_matches_valid_financial_amount_and_percentage():
+    """Defect C Case 1: Financial amount and percentage matching evidence is grounded."""
+    from omnisleuth.evidence.grounding import check_grounding
+    from omnisleuth.evidence.models import EvidenceItem, EvidenceType
+    from omnisleuth.evidence.store import EvidenceStore
+
+    store = EvidenceStore(dataset_id="ds_test", dataset_version="v1")
+    store.add_evidence(
+        EvidenceItem(
+            evidence_id="ev_trend",
+            evidence_type=EvidenceType.DETERMINISTIC_CALC,
+            source_id="calculate_trend",
+            content={"overall_delta": -25000.0, "overall_change_pct": -23.19},
+        )
+    )
+
+    answer = "Calculated overall revenue delta was -$25,000.00 (-23.19%)."
+    grounded, answer_nums, ev_nums = check_grounding(answer, store)
+    assert grounded is True
+    assert -25000.0 in answer_nums
+    assert -23.19 in answer_nums
+
+
+def test_grounding_rejects_unsupported_financial_claims():
+    """Defect C Case 2: An unsupported financial amount or percentage remains ungrounded."""
+    from omnisleuth.evidence.grounding import check_grounding
+    from omnisleuth.evidence.models import EvidenceItem, EvidenceType
+    from omnisleuth.evidence.store import EvidenceStore
+
+    store = EvidenceStore(dataset_id="ds_test", dataset_version="v1")
+    store.add_evidence(
+        EvidenceItem(
+            evidence_id="ev_calc",
+            evidence_type=EvidenceType.DETERMINISTIC_CALC,
+            source_id="calc",
+            content={"revenue": 5000.0, "pct": 10.0},
+        )
+    )
+
+    # Fabricated financial claims
+    answer = "Revenue was $999,999.00 with a decline of -85.5%."
+    grounded, answer_nums, ev_nums = check_grounding(answer, store)
+    assert grounded is False
+
+
+def test_grounding_distinguishes_non_financial_confidence_scores_from_claims():
+    """Defect C Case 3: Confidence scores (e.g. 80%) are not treated as financial claims.
+
+    Reproduces the smoke test failure where deep-investigation report containing
+    -23.19% and (Confidence: 80%), (Confidence: 85%), (Confidence: 100%) failed grounding.
+    """
+    from omnisleuth.evidence.grounding import check_grounding, extract_currency_and_percentages
+    from omnisleuth.evidence.models import EvidenceItem, EvidenceType
+    from omnisleuth.evidence.store import EvidenceStore
+
+    store = EvidenceStore(dataset_id="ds_test", dataset_version="v1")
+    store.add_evidence(
+        EvidenceItem(
+            evidence_id="ev_trend",
+            evidence_type=EvidenceType.DETERMINISTIC_CALC,
+            source_id="calculate_trend",
+            content={"overall_delta": -25000.0, "overall_change_pct": -23.19},
+        )
+    )
+
+    deep_report = (
+        "# Multi-Agent Investigation Report\n"
+        "## 1. Verified Analytical Claims\n"
+        "- ✅ [SUPPORTED]: Overall revenue delta across observed period was -$25,000.00 (-23.19%).\n"
+        "## 2. Tested Hypotheses\n"
+        "- 🟢 **Hypothesis**: Segment variance drove change.\n"
+        "  - **Status**: `supported` (Confidence: 80%)\n"
+        "- 🟢 **Hypothesis**: Anomalies affected performance.\n"
+        "  - **Status**: `supported` (Confidence: 85%)\n"
+        "- ⚪ **Hypothesis**: Baseline stability.\n"
+        "  - **Status**: `inconclusive` (Confidence: 100%)\n"
+    )
+
+    extracted = extract_currency_and_percentages(deep_report)
+    assert -25000.0 in extracted
+    assert -23.19 in extracted
+    # Confidence percentages must NOT be extracted as financial claims
+    assert 80.0 not in extracted
+    assert 85.0 not in extracted
+    assert 100.0 not in extracted
+
+    grounded, answer_nums, ev_nums = check_grounding(deep_report, store)
+    assert grounded is True
+
+
+def test_grounding_rejects_answer_with_no_checkable_financial_claims():
+    """Defect C Case 4: An answer with no checkable financial claims must NOT silently pass."""
+    from omnisleuth.evidence.grounding import check_grounding
+    from omnisleuth.evidence.models import EvidenceItem, EvidenceType
+    from omnisleuth.evidence.store import EvidenceStore
+
+    store = EvidenceStore(dataset_id="ds_test", dataset_version="v1")
+    store.add_evidence(
+        EvidenceItem(
+            evidence_id="ev_calc",
+            evidence_type=EvidenceType.DETERMINISTIC_CALC,
+            source_id="calc",
+            content={"revenue": 5000.0},
+        )
+    )
+
+    # Non-financial narrative with no checkable currency or percentage claims
+    answer = "The investigation completed successfully and all hypotheses were evaluated."
+    grounded, answer_nums, ev_nums = check_grounding(answer, store)
+    assert grounded is False
+    assert len(answer_nums) == 0
+
+
+def test_grounding_excludes_actual_report_metadata_and_rag_formula():
+    """Defect C Follow-up Case 1: Exclude confidence, completeness, and formula multiplier metadata.
+
+    Reproduces the smoke test failure where deep-investigation report contained
+    valid claim -23.19%, hypothesis confidence scores (80%, 85%, 90%), and
+    RAG formula definition '(Delta_segment / Delta_total) * 100%' which extracted
+    100.0% and failed evidence matching.
+    """
+    from omnisleuth.evidence.grounding import check_grounding, extract_currency_and_percentages
+    from omnisleuth.evidence.models import EvidenceItem, EvidenceType
+    from omnisleuth.evidence.store import EvidenceStore
+
+    store = EvidenceStore(dataset_id="ds_test", dataset_version="v1")
+    store.add_evidence(
+        EvidenceItem(
+            evidence_id="ev_trend",
+            evidence_type=EvidenceType.DETERMINISTIC_CALC,
+            source_id="calculate_trend",
+            content={"overall_delta": -54539.65, "overall_change_pct": -23.19},
+        )
+    )
+
+    actual_report = (
+        "# Multi-Agent Investigation Report\n"
+        '**Question:** *"Why did revenue decline in March?"*\n'
+        "## 1. Verified Analytical Claims (Programmatically Validated)\n"
+        "- ✅ **[SUPPORTED]**: Calculated overall revenue delta across the observed period was -$54,539.65 (-23.19%).\n"
+        "## 2. Tested Hypotheses\n"
+        "- 🔴 **Hypothesis**: Changes in specific segments contributed to variance.\n"
+        "  - **Status**: `rejected` (Confidence: 80%)\n"
+        "- 🟢 **Hypothesis**: Statistical anomaly events affected performance.\n"
+        "  - **Status**: `supported` (Confidence: 85%)\n"
+        "- 🟢 **Hypothesis**: Operational factors provide context.\n"
+        "  - **Status**: `supported` (Confidence: 90%)\n"
+        "## 3. Contextual RAG Business Evidence\n"
+        "- 📄 **Executive KPI Definitions & Methodology** (Score: 0.98):\n"
+        '  > *"# Executive KPI Definitions & Business Metrics\n'
+        "- **Segment Contribution**: The proportion of metric change attributable to an individual dimension: `(Delta_segment / Delta_total) * 100%`.\n"
+        '- **Return Rate**: Percentage of processed orders flagged with `is_returned = True`."*\n'
+    )
+
+    extracted = extract_currency_and_percentages(actual_report)
+    assert -54539.65 in extracted
+    assert -23.19 in extracted
+    # Confidence and formula scaling metadata must NOT be extracted
+    assert 80.0 not in extracted
+    assert 85.0 not in extracted
+    assert 90.0 not in extracted
+    assert 100.0 not in extracted
+
+    grounded, answer_nums, ev_nums = check_grounding(actual_report, store)
+    assert grounded is True
+
+
+def test_grounding_supports_legitimate_financial_percentage_of_100():
+    """Defect C Follow-up Case 2: A genuine 100% financial claim remains checkable and grounded."""
+    from omnisleuth.evidence.grounding import check_grounding, extract_currency_and_percentages
+    from omnisleuth.evidence.models import EvidenceItem, EvidenceType
+    from omnisleuth.evidence.store import EvidenceStore
+
+    store = EvidenceStore(dataset_id="ds_test", dataset_version="v1")
+    store.add_evidence(
+        EvidenceItem(
+            evidence_id="ev_share",
+            evidence_type=EvidenceType.DETERMINISTIC_CALC,
+            source_id="calculate_share",
+            content={"segment": "North", "revenue": 100000.0, "share_pct": 100.0},
+        )
+    )
+
+    answer = "North region accounted for $100,000.00 (100.0% of total revenue)."
+    extracted = extract_currency_and_percentages(answer)
+    assert 100000.0 in extracted
+    assert 100.0 in extracted
+
+    grounded, answer_nums, ev_nums = check_grounding(answer, store)
+    assert grounded is True
+    assert 100.0 in answer_nums
+
+
+def test_grounding_rejects_unsupported_100_percent_financial_claim():
+    """Defect C Follow-up Case 3: An unsupported 100% financial claim is extracted and fails."""
+    from omnisleuth.evidence.grounding import check_grounding, extract_currency_and_percentages
+    from omnisleuth.evidence.models import EvidenceItem, EvidenceType
+    from omnisleuth.evidence.store import EvidenceStore
+
+    store = EvidenceStore(dataset_id="ds_test", dataset_version="v1")
+    store.add_evidence(
+        EvidenceItem(
+            evidence_id="ev_share",
+            evidence_type=EvidenceType.DETERMINISTIC_CALC,
+            source_id="calculate_share",
+            content={"segment": "North", "revenue": 25000.0, "share_pct": 25.0},
+        )
+    )
+
+    answer = "North region accounted for $25,000.00 (100.0% of total revenue)."
+    extracted = extract_currency_and_percentages(answer)
+    assert 100.0 in extracted
+
+    grounded, answer_nums, ev_nums = check_grounding(answer, store)
+    assert grounded is False
+    assert 100.0 in answer_nums
+
+
+def test_grounding_rejects_answer_with_only_metadata_filtered():
+    """Defect C Follow-up Case 4: Answer with only confidence/completeness metadata does not pass."""
+    from omnisleuth.evidence.grounding import check_grounding, extract_currency_and_percentages
+    from omnisleuth.evidence.models import EvidenceItem, EvidenceType
+    from omnisleuth.evidence.store import EvidenceStore
+
+    store = EvidenceStore(dataset_id="ds_test", dataset_version="v1")
+    store.add_evidence(
+        EvidenceItem(
+            evidence_id="ev_any",
+            evidence_type=EvidenceType.DETERMINISTIC_CALC,
+            source_id="calc",
+            content={"metric": 100.0},
+        )
+    )
+
+    answer = (
+        "Analysis finished. Status: supported (Confidence: 100%). "
+        "Dataset completeness is 100.0% (100% complete). "
+        "Calculated using formula: (Delta / Total) * 100%."
+    )
+    extracted = extract_currency_and_percentages(answer)
+    assert len(extracted) == 0
+
+    grounded, answer_nums, ev_nums = check_grounding(answer, store)
+    # Must remain ungrounded because there are no checkable financial claims
+    assert grounded is False
+    assert len(answer_nums) == 0
+
+
+def test_grounding_fails_when_metadata_filtered_but_financial_claim_unsupported():
+    """Defect C Follow-up Case 5: Checker does not pass merely because metadata was filtered out."""
+    from omnisleuth.evidence.grounding import check_grounding, extract_currency_and_percentages
+    from omnisleuth.evidence.models import EvidenceItem, EvidenceType
+    from omnisleuth.evidence.store import EvidenceStore
+
+    store = EvidenceStore(dataset_id="ds_test", dataset_version="v1")
+    store.add_evidence(
+        EvidenceItem(
+            evidence_id="ev_trend",
+            evidence_type=EvidenceType.DETERMINISTIC_CALC,
+            source_id="calc",
+            content={"overall_change_pct": -23.19},
+        )
+    )
+
+    # Has metadata AND an unsupported financial claim (-95.0%)
+    answer = (
+        "Overall revenue declined by -95.0% across the period. "
+        "Hypothesis evaluation: (Confidence: 100%), ratio * 100%."
+    )
+    extracted = extract_currency_and_percentages(answer)
+    assert -95.0 in extracted
+    assert 100.0 not in extracted
+
+    grounded, answer_nums, ev_nums = check_grounding(answer, store)
+    assert grounded is False
