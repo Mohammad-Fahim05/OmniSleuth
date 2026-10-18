@@ -4,7 +4,17 @@
 
 OmniSleuth is a bounded, production-inspired AI/ML data investigation system designed to analyze structured business and operational datasets (e.g., sales, revenue, orders, inventory). Rather than acting like a naive conversational chatbot that hallucinates calculations and asserts unsubstantiated causal claims, OmniSleuth enforces **deterministic Python execution**, **allowlisted analytical tools**, **programmatic evidence provenance**, **hybrid contextual retrieval (RAG)**, **finite state machine orchestration**, **dual-layer guardrails**, and a **production-grade LLM Gateway with deterministic offline fallback**.
 
-The entire system is **100% offline-first reproducible**, executing all 105 unit and integration tests, ML detectors, hybrid retrieval pipelines, and empirical evaluations without external network access or paid API keys.
+The entire system is **100% offline-first reproducible**, executing all 509 unit, integration, and security tests, ML detectors, hybrid retrieval pipelines, and empirical evaluations without external network access or paid API keys.
+
+---
+
+## Documentation Quick Links
+
+- 🏛️ **[System Architecture & Component Design](docs/ARCHITECTURE.md)**: End-to-end architecture, 6-tab UI workspace, deterministic execution engine, and Mermaid workflow diagrams.
+- ⚙️ **[Setup & Operations Guide](docs/OPERATIONS.md)**: Local installation, running tests, dataset loading/uploading, backup/restore procedures, and troubleshooting.
+- 🛡️ **[Security Architecture & Deployment Boundaries](docs/SECURITY.md)**: Upload validation, Excel defenses, session isolation, and production reverse proxy requirements.
+- 🎯 **[Technical Interview & Viva Defense Guide](docs/INTERVIEW_GUIDE.md)**: Detailed answers to 10 core technical interview questions with honest trade-offs.
+- 📋 **[Project Presentation & Executive Summary](docs/PROJECT_SUMMARY.md)**: Resume description, 90-second elevator pitch, implemented vs. future feature matrix, and live demo script.
 
 ---
 
