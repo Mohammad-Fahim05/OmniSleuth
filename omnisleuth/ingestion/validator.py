@@ -17,6 +17,9 @@ SUPPORTED_EXTENSIONS: Set[str] = {".csv", ".parquet", ".xlsx"}
 # Default upload size limit (50 MB)
 DEFAULT_MAX_UPLOAD_SIZE_BYTES: int = 50 * 1024 * 1024
 
+# Default maximum allowed column count (DoS prevention)
+DEFAULT_MAX_COLUMNS: int = 1000
+
 # Known binary magic prefixes that must not be parsed as plain text CSV
 BINARY_MAGIC_PREFIXES: list[Tuple[bytes, str]] = [
     (b"MZ", "Windows executable (PE)"),
@@ -41,6 +44,7 @@ class DatasetValidator:
         self,
         max_file_size_bytes: Optional[int] = None,
         allowed_extensions: Optional[Set[str]] = None,
+        max_columns: Optional[int] = None,
     ):
         if max_file_size_bytes is not None:
             self.max_file_size_bytes = max_file_size_bytes
@@ -53,6 +57,7 @@ class DatasetValidator:
                 self.max_file_size_bytes = DEFAULT_MAX_UPLOAD_SIZE_BYTES
 
         self.allowed_extensions = allowed_extensions or set(SUPPORTED_EXTENSIONS)
+        self.max_columns = max_columns or DEFAULT_MAX_COLUMNS
 
     def validate_file_metadata(self, file_path: Union[str, Path]) -> Path:
         """Validate file existence, file type, allowed extensions, and size limits."""
@@ -115,6 +120,33 @@ class DatasetValidator:
             try:
                 with zipfile.ZipFile(path, "r") as zf:
                     namelist = zf.namelist()
+
+                    # Check for path traversal or dangerous archive member names
+                    for entry_name in namelist:
+                        if entry_name.startswith("/") or entry_name.startswith("\\") or ".." in entry_name:
+                            raise IngestionError(
+                                f"Invalid Excel file '{path.name}': Malicious path traversal entry in archive."
+                            )
+                        # Reject macro-enabled workbooks disguised as .xlsx
+                        if "vbaproject.bin" in entry_name.lower():
+                            raise IngestionError(
+                                f"Invalid Excel file '{path.name}': Macro-enabled workbooks (.xlsm / VBA) are not permitted."
+                            )
+
+                    # Zip bomb protection: check total uncompressed size and compression ratio
+                    total_uncompressed = sum(info.file_size for info in zf.infolist())
+                    max_uncompressed = self.max_file_size_bytes * 10
+                    if total_uncompressed > max_uncompressed:
+                        raise IngestionError(
+                            f"Invalid Excel file '{path.name}': Uncompressed archive size exceeds safe limit."
+                        )
+
+                    compressed_size = sum(info.compress_size for info in zf.infolist())
+                    if compressed_size > 0 and (total_uncompressed / compressed_size) > 100.0:
+                        raise IngestionError(
+                            f"Invalid Excel file '{path.name}': Suspicious compression ratio (zip bomb protection)."
+                        )
+
                     if not any(
                         entry in namelist
                         for entry in [
@@ -163,6 +195,10 @@ class DatasetValidator:
             raise IngestionError(f"Dataset file '{dataset_name}' has no columns or data.")
         if len(df.columns) == 0:
             raise IngestionError(f"Dataset file '{dataset_name}' contains no columns.")
+        if len(df.columns) > self.max_columns:
+            raise IngestionError(
+                f"Dataset file '{dataset_name}' exceeds maximum allowed column count ({len(df.columns)} > {self.max_columns})."
+            )
         if len(df) == 0:
             raise IngestionError(f"Dataset file '{dataset_name}' contains headers but no data rows.")
 

@@ -56,7 +56,7 @@ class Repository:
             existing_row = cur.fetchone()
             if existing_row:
                 existing_session = existing_row["session_id"]
-                if existing_session is not None and owner_session is not None and existing_session != owner_session:
+                if existing_session is not None and existing_session != owner_session:
                     raise IngestionError(
                         f"Access denied: Dataset '{metadata.dataset_id}' belongs to another session."
                     )
@@ -295,7 +295,20 @@ class Repository:
         if not dataset:
             return False
 
+        # Enforce session ownership: unowned request or mismatched session cannot delete owned dataset
+        if dataset.get("session_id") is not None and (session_id is None or session_id != dataset["session_id"]):
+            return False
+
         with self.db.get_connection() as conn:
+            # Cascade deletion of child investigation records (tool executions, evidence, hypotheses, claims)
+            cur = conn.execute("SELECT investigation_id FROM investigations WHERE dataset_id = ?", (dataset_id,))
+            inv_ids = [row["investigation_id"] for row in cur.fetchall()]
+            for inv_id in inv_ids:
+                conn.execute("DELETE FROM tool_executions WHERE investigation_id = ?", (inv_id,))
+                conn.execute("DELETE FROM evidence_items WHERE investigation_id = ?", (inv_id,))
+                conn.execute("DELETE FROM hypotheses WHERE investigation_id = ?", (inv_id,))
+                conn.execute("DELETE FROM claims WHERE investigation_id = ?", (inv_id,))
+
             conn.execute("DELETE FROM dataset_versions WHERE dataset_id = ?", (dataset_id,))
             conn.execute("DELETE FROM investigations WHERE dataset_id = ?", (dataset_id,))
             conn.execute("DELETE FROM datasets WHERE dataset_id = ?", (dataset_id,))
@@ -371,6 +384,16 @@ class Repository:
                     session_id = r["session_id"]
 
         with self.db.get_connection() as conn:
+            # Enforce investigation ownership: foreign session cannot overwrite an existing investigation
+            cur = conn.execute("SELECT session_id FROM investigations WHERE investigation_id = ?", (investigation_id,))
+            inv_row = cur.fetchone()
+            if inv_row:
+                existing_inv_session = inv_row["session_id"]
+                if existing_inv_session is not None and existing_inv_session != session_id:
+                    raise IngestionError(
+                        f"Access denied: Investigation '{investigation_id}' belongs to another session."
+                    )
+
             # 1. Investigations table
             conn.execute(
                 """
