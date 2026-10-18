@@ -11,6 +11,10 @@ services:
       - PORT=8501
       - APP_ENV=production
       - LOG_LEVEL=INFO
+      - SQLITE_DB_PATH=/app/data/omnisleuth.db
+      - UPLOADS_DIR=/app/data/uploads
+      - VECTORSTORE_DIR=/app/data/vectorstore
+      - LOG_FILE=/app/logs/omnisleuth.log
       - DATABASE_URL=sqlite:////app/persisted_data/omnisleuth.db
     env_file:
       - .env.example

@@ -28,6 +28,7 @@ tmp/
 # Secrets & Local configuration
 .env
 *.local
+.streamlit/secrets.toml
 
 # Packaging & Build artifacts
 dist/
@@ -35,5 +36,17 @@ build/
 *.egg-info/
 omnisleuth.egg-info/
 
-# Artifacts / Brain data
+# Local databases, uploads & runtime data (preserved on host, mounted at runtime)
+data/
+persisted_data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local audit & frozen compliance artifacts
+audit/
+FROZEN_SCOPE_GAP_REPORT.md
+
+# Artifacts & Temporary storage
 .system_generated/
+tests/

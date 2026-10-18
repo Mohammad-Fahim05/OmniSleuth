@@ -10,7 +10,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PORT=8501
+    PORT=8501 \
+    PYTHONPATH=/app \
+    SQLITE_DB_PATH=/app/data/omnisleuth.db \
+    UPLOADS_DIR=/app/data/uploads \
+    VECTORSTORE_DIR=/app/data/vectorstore \
+    LOG_FILE=/app/logs/omnisleuth.log
 
 WORKDIR /app
 
@@ -30,13 +35,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN groupadd -g 10001 appuser && \
     useradd -u 10001 -g appuser -m -s /bin/bash appuser
 
-# Copy application source code and data
+# Copy application source code and Streamlit configuration
 COPY omnisleuth/ omnisleuth/
-COPY data/ data/
-COPY .env.example .env
+COPY .streamlit/ .streamlit/
+
+# Install omnisleuth package without re-downloading dependencies
+RUN pip install --no-cache-dir --no-deps -e .
 
 # Create persistent storage directories and assign ownership to non-root appuser
-RUN mkdir -p /app/persisted_data /app/data /home/appuser/.streamlit && \
+RUN mkdir -p /app/data/uploads /app/data/vectorstore /app/logs /app/persisted_data /home/appuser/.streamlit && \
     chown -R appuser:appuser /app /home/appuser
 
 # Switch to non-root user
