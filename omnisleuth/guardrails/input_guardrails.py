@@ -24,8 +24,9 @@ logger = get_logger("guardrails.input")
 class InputGuardrailEngine:
     """Pre-planning input guardrail validator enforcing system boundaries and safety."""
 
-    def __init__(self):
+    def __init__(self, max_question_length: int = 500):
         self.on_topic_keywords: Set[str] = set(ON_TOPIC_KEYWORDS)
+        self.max_question_length = max_question_length
 
     def _normalize(self, text: str) -> str:
         """Normalize query text for consistent, robust regex pattern evaluation."""
@@ -136,44 +137,85 @@ class InputGuardrailEngine:
         # If neutral/uncertain, permit exploration
         return TopicScope.UNCERTAIN, None
 
-    def validate_input(self, question: str) -> GuardrailResult:
-        """Execute full input guardrail pipeline: Injection -> Jailbreak -> Code -> Scope."""
-        clean_q = question.strip() if question else ""
-        if not clean_q:
+    def validate_input(self, question: str, check_scope: bool = True) -> GuardrailResult:
+        """Execute full input guardrail pipeline: Type/Bounds -> Injection -> Jailbreak -> Code -> Scope."""
+        try:
+            # 0. Malformed / Type check
+            if not isinstance(question, str) or "\x00" in question:
+                logger.warning("Input Guardrail Block: Malformed question input")
+                return GuardrailResult(
+                    allowed=False,
+                    decision=GuardrailDecision.BLOCK,
+                    category=GuardrailCategory.INVALID_INPUT,
+                    severity=GuardrailSeverity.LOW,
+                    reason="Malformed question input provided.",
+                    user_message="Please provide a valid text question.",
+                )
+
+            clean_q = question.strip()
+            if not clean_q:
+                return GuardrailResult(
+                    allowed=False,
+                    decision=GuardrailDecision.BLOCK,
+                    category=GuardrailCategory.INVALID_INPUT,
+                    severity=GuardrailSeverity.LOW,
+                    reason="Empty question string provided.",
+                    user_message="Please provide a valid analytical question regarding the dataset.",
+                )
+
+            # 0.1 Length Bounds Check
+            if len(clean_q) > self.max_question_length:
+                logger.warning(
+                    f"Input Guardrail Block: Oversized question ({len(clean_q)} > {self.max_question_length} chars)"
+                )
+                return GuardrailResult(
+                    allowed=False,
+                    decision=GuardrailDecision.BLOCK,
+                    category=GuardrailCategory.INVALID_INPUT,
+                    severity=GuardrailSeverity.MEDIUM,
+                    reason=f"Question exceeds maximum allowed length of {self.max_question_length} characters.",
+                    user_message=(
+                        f"Question exceeds the maximum allowed length of {self.max_question_length} characters. "
+                        "Please provide a more concise question."
+                    ),
+                )
+
+            # 1. Prompt Injection
+            inj_res = self.check_prompt_injection(clean_q)
+            if inj_res:
+                return inj_res
+
+            # 2. Jailbreak
+            jb_res = self.check_jailbreak(clean_q)
+            if jb_res:
+                return jb_res
+
+            # 3. Arbitrary Code Execution
+            code_res = self.check_arbitrary_code(clean_q)
+            if code_res:
+                return code_res
+
+            # 4. Scope Classification
+            if check_scope:
+                scope, off_res = self.check_topic_scope(clean_q)
+                if off_res:
+                    return off_res
+
+            # Allowed
+            return GuardrailResult(
+                allowed=True,
+                decision=GuardrailDecision.ALLOW,
+                category=GuardrailCategory.SAFE,
+                severity=GuardrailSeverity.LOW,
+                reason="Input verified as safe, on-topic analytical inquiry.",
+            )
+        except Exception as exc:
+            logger.error(f"Input guardrail evaluation error: {exc}", exc_info=True)
             return GuardrailResult(
                 allowed=False,
                 decision=GuardrailDecision.BLOCK,
-                category=GuardrailCategory.OFF_TOPIC,
-                severity=GuardrailSeverity.LOW,
-                reason="Empty question string provided.",
-                user_message="Please provide a valid analytical question regarding the dataset.",
+                category=GuardrailCategory.INVALID_INPUT,
+                severity=GuardrailSeverity.HIGH,
+                reason=f"Input guardrail processing error: {type(exc).__name__}",
+                user_message="The inquiry could not be safely validated.",
             )
-
-        # 1. Prompt Injection
-        inj_res = self.check_prompt_injection(clean_q)
-        if inj_res:
-            return inj_res
-
-        # 2. Jailbreak
-        jb_res = self.check_jailbreak(clean_q)
-        if jb_res:
-            return jb_res
-
-        # 3. Arbitrary Code Execution
-        code_res = self.check_arbitrary_code(clean_q)
-        if code_res:
-            return code_res
-
-        # 4. Scope Classification
-        scope, off_res = self.check_topic_scope(clean_q)
-        if off_res:
-            return off_res
-
-        # Allowed
-        return GuardrailResult(
-            allowed=True,
-            decision=GuardrailDecision.ALLOW,
-            category=GuardrailCategory.SAFE,
-            severity=GuardrailSeverity.LOW,
-            reason="Input verified as safe, on-topic analytical inquiry.",
-        )

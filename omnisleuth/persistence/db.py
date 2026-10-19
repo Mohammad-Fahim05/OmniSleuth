@@ -114,9 +114,27 @@ class DatabaseManager:
         conn.execute("PRAGMA busy_timeout = 30000;")
         return conn
 
-    def initialize_schema(self) -> None:
-        """Create database tables if they do not already exist, then apply additive migrations."""
+    def get_journal_mode(self) -> str:
+        """Query the currently active SQLite journal mode."""
         with self.get_connection() as conn:
+            cur = conn.execute("PRAGMA journal_mode;")
+            row = cur.fetchone()
+            return str(row[0]).upper() if row else ""
+
+    def initialize_schema(self) -> None:
+        """Create database tables if they do not already exist, configure WAL mode, and apply additive migrations."""
+        with self.get_connection() as conn:
+            # Configure WAL mode safely on disk databases during initialization.
+            # WAL mode is persistent in the SQLite database header across subsequent connections.
+            if str(self.db_path) != ":memory:":
+                try:
+                    cur = conn.execute("PRAGMA journal_mode = WAL;")
+                    row = cur.fetchone()
+                    mode = str(row[0]).upper() if row else "UNKNOWN"
+                    logger.info(f"SQLite journal mode configured: {mode} ({self.db_path})")
+                except sqlite3.OperationalError as exc:
+                    logger.warning(f"Could not configure WAL journal mode for {self.db_path}: {exc}")
+
             conn.executescript(SCHEMA_SQL)
             self._apply_additive_migrations(conn)
             conn.commit()

@@ -333,7 +333,7 @@ def test_persistence_save_and_reopen(tmp_path, test_dataset):
     df, metadata, schema_ctx = test_dataset
     db_file = str(tmp_path / "persist_test.db")
     db_mgr = DatabaseManager(db_path=db_file)
-    repo = Repository(db_manager=db_mgr)
+    repo = Repository(db_manager=db_mgr, session_id="test_nlq_session")
     repo.save_dataset(metadata)
 
     planner = RulePlanner()

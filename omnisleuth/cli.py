@@ -43,7 +43,27 @@ def main():
     gen_parser.add_argument("--rows", type=int, default=1000, help="Number of rows")
     gen_parser.add_argument("--output", type=str, default="data/uploads/sample_sales_2024.csv", help="Output path")
 
+    # 5. Upload retention cleanup command
+    clean_parser = subparsers.add_parser("cleanup-uploads", help="Clean up expired upload files based on retention policy")
+    clean_parser.add_argument("--days", type=int, default=None, help="Retention period in days (defaults to config)")
+    clean_parser.add_argument("--apply", action="store_true", help="Actually delete eligible expired files (defaults to dry-run preview)")
+
     args = parser.parse_args()
+
+    if args.command == "cleanup-uploads":
+        from omnisleuth.ingestion.retention import cleanup_expired_uploads
+
+        dry_run = not args.apply
+        report = cleanup_expired_uploads(retention_days=args.days, dry_run=dry_run)
+        mode_str = "DRY-RUN (Preview)" if dry_run else "APPLIED (Deleted)"
+        print(f"\n🧹 Upload Retention Cleanup [{mode_str}] (Retention: {report.retention_days} days)")
+        print(f"Scanned files: {report.scanned_files}")
+        print(f"Expired files: {len(report.expired_files)}")
+        print(f"Active preserved files: {len(report.skipped_active_files)}")
+        print(f"Recent files: {len(report.skipped_recent_files)}")
+        print(f"Deleted files: {len(report.deleted_files)}")
+        print(f"Freed space: {report.freed_bytes / 1024:.1f} KB\n")
+        return
 
     # Default to benchmark dataset if not specified
     csv_path = args.csv if hasattr(args, "csv") and args.csv else "data/uploads/sample_sales_2024.csv"
@@ -55,9 +75,9 @@ def main():
         generate_benchmark_sales_dataset(n_rows=1000, random_seed=42, output_path=path_obj)
 
     loader = CSVLoader()
-    df, metadata = loader.load_csv(path_obj)
-    repo = Repository()
-    repo.save_dataset(metadata)
+    df, metadata = loader.load_csv(path_obj, session_id="cli_local")
+    repo = Repository(session_id="cli_local")
+    repo.save_dataset(metadata, session_id="cli_local")
 
     if args.command == "investigate" or (len(sys.argv) > 1 and not args.command):
         question = args.question if hasattr(args, "question") else sys.argv[1]

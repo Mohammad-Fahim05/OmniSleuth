@@ -1,5 +1,7 @@
 """Core exceptions for the OmniSleuth system."""
 
+from typing import Optional
+
 
 class OmniSleuthError(Exception):
     """Base exception for all OmniSleuth errors."""
@@ -23,3 +25,21 @@ class ToolExecutionError(OmniSleuthError):
 
 class BoundedLimitExceededError(OmniSleuthError):
     """Raised when an agentic investigation hits maximum depth or tool call limits."""
+
+
+class AccessDeniedError(IngestionError):
+    """Raised when an operation is attempted without valid session context or violates session isolation."""
+
+
+class RateLimitExceededError(OmniSleuthError):
+    """Raised when an operation exceeds configured session rate limits."""
+
+    def __init__(
+        self,
+        message: str,
+        action: str = "request",
+        retry_after_seconds: Optional[float] = None,
+    ):
+        super().__init__(message)
+        self.action = action
+        self.retry_after_seconds = retry_after_seconds

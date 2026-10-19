@@ -31,6 +31,22 @@ class Settings(BaseSettings):
         default=50 * 1024 * 1024,
         description="Maximum allowed dataset upload size in bytes (default 50 MB)",
     )
+    max_upload_rows: int = Field(
+        default=1_000_000,
+        description="Maximum allowed dataset row count (default 1,000,000)",
+    )
+    rate_limit_questions_per_minute: int = Field(
+        default=30,
+        description="Maximum natural language questions per minute per session",
+    )
+    rate_limit_uploads_per_hour: int = Field(
+        default=20,
+        description="Maximum dataset uploads per hour per session",
+    )
+    upload_retention_days: int = Field(
+        default=30,
+        description="Upload retention period in days (default 30 days)",
+    )
 
     # Storage Paths
     base_dir: Path = Field(default_factory=lambda: Path(__file__).resolve().parent.parent.parent)
@@ -78,6 +94,10 @@ class Settings(BaseSettings):
     nlq_narration_enabled: bool = Field(
         default=False,
         description="Optional LLM rewriting of templated answers (numbers must stay evidence-grounded)",
+    )
+    nlq_max_question_length: int = Field(
+        default=500,
+        description="Maximum allowed character length for natural language questions",
     )
 
     # Semantic Cache

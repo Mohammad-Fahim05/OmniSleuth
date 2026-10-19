@@ -6,10 +6,16 @@ from omnisleuth.core.exceptions import (
     ConfigurationError,
     IngestionError,
     OmniSleuthError,
+    RateLimitExceededError,
     ToolExecutionError,
     ValidationError,
 )
 from omnisleuth.core.logging import configure_logging, get_logger
+from omnisleuth.core.rate_limiter import (
+    InMemoryRateLimiter,
+    get_rate_limiter,
+    reset_rate_limiter,
+)
 
 __all__ = [
     "Settings",
@@ -21,6 +27,10 @@ __all__ = [
     "ValidationError",
     "ToolExecutionError",
     "BoundedLimitExceededError",
+    "RateLimitExceededError",
+    "InMemoryRateLimiter",
+    "get_rate_limiter",
+    "reset_rate_limiter",
     "configure_logging",
     "get_logger",
 ]

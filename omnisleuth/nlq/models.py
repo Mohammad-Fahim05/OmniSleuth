@@ -152,7 +152,7 @@ class AnalysisPlan(BaseModel, extra="forbid"):
 class QueryResult(BaseModel):
     """Encapsulated execution outcome of an analytical plan."""
 
-    status: str  # "answered", "needs_clarification", "unsupported", "failed"
+    status: str  # "answered", "needs_clarification", "unsupported", "failed", "blocked"
     answer: str
     result_table: Optional[List[Dict[str, Any]]] = None
     chart_spec: Optional[Dict[str, Any]] = None

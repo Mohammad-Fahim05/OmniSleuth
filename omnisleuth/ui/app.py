@@ -12,6 +12,7 @@ from omnisleuth.agents import MultiAgentOrchestrator
 from omnisleuth.core.config import get_settings
 from omnisleuth.core.exceptions import IngestionError
 from omnisleuth.core.logging import get_logger
+from omnisleuth.core.rate_limiter import get_rate_limiter
 from omnisleuth.discovery import DatasetDiscoveryScanner
 from omnisleuth.evaluation import BENCHMARK_QUESTIONS, OmniSleuthEvaluator, generate_benchmark_sales_dataset
 from omnisleuth.evidence.models import (
@@ -183,43 +184,56 @@ with st.sidebar:
             "Upload dataset", type=["csv", "parquet", "xlsx"], label_visibility="visible"
         )
         if uploaded_file is not None:
-            max_upload_size = get_settings().max_upload_size_bytes
-            dest_path = None
-            try:
-                # 1. Sanitize filename, enforce filesystem containment, stream chunked to isolated unique path
-                safe_path, display_name = safe_save_upload(
-                    file_obj=uploaded_file,
-                    raw_filename=uploaded_file.name,
-                    upload_dir=get_settings().uploads_dir,
-                    max_size_bytes=max_upload_size,
+            # 0. Enforce upload rate limit per session before writing any file to disk
+            limiter = get_rate_limiter()
+            is_allowed, count, retry_after = limiter.check("upload", current_session_id, consume=True)
+            if not is_allowed:
+                limit = limiter.get_limit_for_action("upload")
+                logger.warning(
+                    f"Upload rate limit exceeded for session '{current_session_id}' ({count}/{limit})."
                 )
-                dest_path = safe_path
+                st.error(
+                    f"⚠️ **Upload Rate Limit Exceeded**: Session has reached the limit of {limit} uploads per hour. "
+                    f"Please try again in {retry_after / 60:.1f} minutes."
+                )
+            else:
+                max_upload_size = get_settings().max_upload_size_bytes
+                dest_path = None
+                try:
+                    # 1. Sanitize filename, enforce filesystem containment, stream chunked to isolated unique path
+                    safe_path, display_name = safe_save_upload(
+                        file_obj=uploaded_file,
+                        raw_filename=uploaded_file.name,
+                        upload_dir=get_settings().uploads_dir,
+                        max_size_bytes=max_upload_size,
+                    )
+                    dest_path = safe_path
 
-                # 2. Parse and validate content via CSVLoader
-                loader = CSVLoader()
-                df, meta = loader.load_csv(
-                    safe_path,
-                    dataset_name=display_name,
-                    session_id=current_session_id,
-                )
-                repo.save_dataset(
-                    meta,
-                    verify_file=True,
-                    cleanup_on_failure=True,
-                    session_id=current_session_id,
-                )
-                st.session_state.df = df
-                st.session_state.metadata = meta
-            except IngestionError as exc:
-                logger.warning(f"Upload validation failed for '{uploaded_file.name}': {exc}")
-                st.error(f"Upload failed: {exc}")
-                if dest_path and dest_path.exists() and st.session_state.df is None:
-                    safe_cleanup_file(dest_path)
-            except Exception as exc:
-                logger.error(f"Unexpected error loading dataset '{uploaded_file.name}': {exc}", exc_info=True)
-                st.error(f"Failed to process uploaded file '{uploaded_file.name}'. Please ensure it is a valid CSV, Parquet, or XLSX file.")
-                if dest_path and dest_path.exists() and st.session_state.df is None:
-                    safe_cleanup_file(dest_path)
+                    # 2. Parse and validate content via CSVLoader
+                    loader = CSVLoader()
+                    df, meta = loader.load_csv(
+                        safe_path,
+                        dataset_name=display_name,
+                        session_id=current_session_id,
+                    )
+                    repo.save_dataset(
+                        meta,
+                        verify_file=True,
+                        cleanup_on_failure=True,
+                        session_id=current_session_id,
+                    )
+                    st.session_state.df = df
+                    st.session_state.metadata = meta
+                except IngestionError as exc:
+                    logger.warning(f"Upload validation failed for '{uploaded_file.name}': {exc}")
+                    st.error(f"Upload failed: {exc}")
+                    if dest_path and dest_path.exists() and st.session_state.df is None:
+                        safe_cleanup_file(dest_path)
+                except Exception as exc:
+                    logger.error(f"Unexpected error loading dataset '{uploaded_file.name}': {exc}", exc_info=True)
+                    st.error(f"Failed to process uploaded file '{uploaded_file.name}'. Please ensure it is a valid CSV, Parquet, or XLSX file.")
+                    if dest_path and dest_path.exists() and st.session_state.df is None:
+                        safe_cleanup_file(dest_path)
 
     # Saved datasets in this session
     session_saved = repo.list_datasets(check_files=True, session_id=current_session_id)
@@ -250,29 +264,31 @@ with st.sidebar:
                     except IngestionError as exc:
                         st.error(f"Failed to load dataset: {exc}")
 
-    with st.expander("Session & Recovery", expanded=False):
+    with st.expander("Session Details", expanded=False):
         st.markdown(
             f'<div style="font-size:0.75rem;color:#94A3B8;">Current Session ID:</div>'
             f'<div class="sidebar-value" style="font-family:monospace;font-size:0.75rem;word-break:break-all;">{current_session_id}</div>',
             unsafe_allow_html=True,
         )
-        reconnect_id = st.text_input("Resume session ID", key="reconnect_session_input", placeholder="sess_...")
-        if st.button("Resume Session", key="btn_reconnect_session", use_container_width=True):
-            if reconnect_id.strip():
-                clean_id = reconnect_id.strip()
-                existing_ds = repo.list_datasets(check_files=False, session_id=clean_id)
-                existing_inv = repo.list_investigations(session_id=clean_id)
-                if existing_ds or existing_inv:
-                    st.session_state.session_id = clean_id
-                    st.session_state.df = None
-                    st.session_state.metadata = None
-                    st.session_state.last_inv = None
-                    st.success(f"Resumed session: {clean_id}")
-                    st.rerun()
-                else:
-                    st.error("Session ID not found or contains no persisted records.")
-            else:
-                st.warning("Please enter a valid session ID.")
+        st.markdown(
+            """
+            <div style="font-size:0.75rem;color:#94A3B8;margin-top:0.5rem;line-height:1.4;">
+                <strong style="color:#E2E8F0;">Session Isolation:</strong> Sessions are strictly isolated to protect data privacy.
+                Unauthenticated session resumption has been disabled to prevent cross-session data access.
+                <br><br>
+                <em style="color:#CBD5E1;">Browser Refresh Notice:</em> Refreshing your browser will initialize a new isolated session.
+                Previously uploaded datasets remain protected under their originating session and cannot be accessed from new sessions.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Start New Session", key="btn_start_new_session", use_container_width=True):
+            st.session_state.session_id = f"sess_{uuid.uuid4().hex[:16]}"
+            st.session_state.df = None
+            st.session_state.metadata = None
+            st.session_state.last_inv = None
+            st.session_state.nlq_history = []
+            st.rerun()
 
     st.markdown("<hr>", unsafe_allow_html=True)
     if st.session_state.df is not None:
@@ -492,7 +508,10 @@ with tabs[0]:
             try:
                 # Reuse the app's cached repository and orchestrator so the routed
                 # question writes to the same store the history UI reads from.
-                _executor = PlanExecutor(repository=repo, orchestrator=orchestrator)
+                _executor = PlanExecutor(
+                    repository=repo.scoped(current_session_id),
+                    orchestrator=orchestrator,
+                )
                 pipeline = AnalysisPipeline(
                     mode=selected_mode,
                     fallback=app_settings.nlq_planner_fallback,
@@ -503,6 +522,7 @@ with tabs[0]:
                     df,
                     metadata,
                     history_ctx=list(st.session_state.get("nlq_history", [])),
+                    session_id=current_session_id,
                 )
                 st.session_state.nlq_routing = routing
                 st.session_state.nlq_history = (
@@ -912,6 +932,7 @@ with tabs[0]:
                 "needs_clarification": "This question needs one more detail before it can be answered exactly.",
                 "unsupported": "This question cannot be answered from the current dataset schema.",
                 "failed": "This question could not be completed.",
+                "blocked": "This inquiry was blocked by security guardrails.",
             }
             st.error(
                 f"{_status_explanation.get(_result.status, _result.status.title())}\n\n{_result.answer}"

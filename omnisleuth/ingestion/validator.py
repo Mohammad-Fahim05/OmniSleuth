@@ -20,6 +20,9 @@ DEFAULT_MAX_UPLOAD_SIZE_BYTES: int = 50 * 1024 * 1024
 # Default maximum allowed column count (DoS prevention)
 DEFAULT_MAX_COLUMNS: int = 1000
 
+# Default maximum allowed row count (DoS prevention)
+DEFAULT_MAX_ROWS: int = 1_000_000
+
 # Known binary magic prefixes that must not be parsed as plain text CSV
 BINARY_MAGIC_PREFIXES: list[Tuple[bytes, str]] = [
     (b"MZ", "Windows executable (PE)"),
@@ -45,6 +48,7 @@ class DatasetValidator:
         max_file_size_bytes: Optional[int] = None,
         allowed_extensions: Optional[Set[str]] = None,
         max_columns: Optional[int] = None,
+        max_rows: Optional[int] = None,
     ):
         if max_file_size_bytes is not None:
             self.max_file_size_bytes = max_file_size_bytes
@@ -58,6 +62,16 @@ class DatasetValidator:
 
         self.allowed_extensions = allowed_extensions or set(SUPPORTED_EXTENSIONS)
         self.max_columns = max_columns or DEFAULT_MAX_COLUMNS
+
+        if max_rows is not None:
+            self.max_rows = max_rows
+        else:
+            try:
+                from omnisleuth.core.config import get_settings
+
+                self.max_rows = get_settings().max_upload_rows
+            except Exception:
+                self.max_rows = DEFAULT_MAX_ROWS
 
     def validate_file_metadata(self, file_path: Union[str, Path]) -> Path:
         """Validate file existence, file type, allowed extensions, and size limits."""
@@ -198,6 +212,11 @@ class DatasetValidator:
         if len(df.columns) > self.max_columns:
             raise IngestionError(
                 f"Dataset file '{dataset_name}' exceeds maximum allowed column count ({len(df.columns)} > {self.max_columns})."
+            )
+        if self.max_rows is not None and len(df) > self.max_rows:
+            raise IngestionError(
+                f"Dataset file '{dataset_name}' exceeds maximum allowed row count "
+                f"({len(df):,} > {self.max_rows:,} rows)."
             )
         if len(df) == 0:
             raise IngestionError(f"Dataset file '{dataset_name}' contains headers but no data rows.")

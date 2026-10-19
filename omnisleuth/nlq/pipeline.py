@@ -23,13 +23,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from omnisleuth.core.config import get_settings
 from omnisleuth.core.exceptions import ConfigurationError
 from omnisleuth.core.logging import get_logger
+from omnisleuth.core.rate_limiter import InMemoryRateLimiter, get_rate_limiter
+from omnisleuth.guardrails import GuardrailResult, InputGuardrailEngine
 from omnisleuth.ingestion.models import DatasetMetadata
 from omnisleuth.nlq.charting import ChartBuildResult, build_chart_from_table, infer_example_questions
 from omnisleuth.nlq.context import SchemaContext, build_schema_context
 from omnisleuth.nlq.executor import PlanExecutor
 from omnisleuth.nlq.followup import summarize_result
 from omnisleuth.nlq.llm_planner import LLMPlanner, LLMPlanningError
-from omnisleuth.nlq.models import PlanIntent, QueryResult
+from omnisleuth.nlq.models import AnalysisPlan, PlanIntent, QueryResult
 from omnisleuth.nlq.narration import NarrationResult, narrate
 from omnisleuth.nlq.planner import Planner
 from omnisleuth.nlq.rule_planner import RulePlanner
@@ -76,6 +78,9 @@ class PlanRoutingResult(BaseModel):
     chart: Optional[ChartBuildResult] = Field(default=None, description="Chart built from the computed table")
     narration: Optional[NarrationResult] = Field(default=None, description="Optional narration outcome")
     history_entry: Dict[str, Any] = Field(default_factory=dict, description="Compact turn summary for follow-ups")
+    input_guardrail_result: Optional[GuardrailResult] = Field(
+        default=None, description="Outcome of input guardrail evaluation"
+    )
     result: QueryResult
 
 
@@ -95,6 +100,9 @@ class AnalysisPipeline:
         llm_planner: Optional[LLMPlanner] = None,
         validator: Optional[PlanValidator] = None,
         executor: Optional[PlanExecutor] = None,
+        input_guardrails: Optional[InputGuardrailEngine] = None,
+        check_topic_scope: bool = False,
+        rate_limiter: Optional[InMemoryRateLimiter] = None,
     ):
         self.settings = get_settings()
         self.mode = self._normalize_mode(mode or self.settings.nlq_planner_mode)
@@ -103,6 +111,10 @@ class AnalysisPipeline:
         self._llm_planner = llm_planner
         self.plan_validator = validator or PlanValidator()
         self.executor = executor or PlanExecutor()
+        max_q_len = getattr(self.settings, "nlq_max_question_length", 500)
+        self.input_guardrails = input_guardrails or InputGuardrailEngine(max_question_length=max_q_len)
+        self.check_topic_scope = check_topic_scope
+        self.rate_limiter = rate_limiter or get_rate_limiter()
 
     # ── Validation of configuration ───────────────────────────────────────────
 
@@ -150,14 +162,103 @@ class AnalysisPipeline:
         df: pd.DataFrame,
         metadata: DatasetMetadata,
         history_ctx: Optional[List[Dict[str, Any]]] = None,
+        session_id: Optional[str] = None,
     ) -> PlanRoutingResult:
-        """Answer a question: plan, validate, execute — never the reverse order."""
+        """Answer a question: validate input, plan, validate, execute — never the reverse order."""
+        # 1. Input Guardrails validation runs before any planner, LLM, or tool invocation.
+        guard_res = self.input_guardrails.validate_input(
+            question, check_scope=self.check_topic_scope
+        )
+        if not guard_res.allowed:
+            logger.warning(
+                "Input guardrail blocked query '%s' [%s]: %s",
+                str(question)[:60],
+                guard_res.category.value,
+                guard_res.reason,
+            )
+            blocked_plan = AnalysisPlan(
+                intent=PlanIntent.UNSUPPORTED,
+                confidence=0.0,
+                unsupported_reason=guard_res.user_message or guard_res.reason,
+                assumptions=[f"Guardrail block ({guard_res.category.value}): {guard_res.reason}"],
+                planner="deterministic",
+            )
+            blocked_result = QueryResult(
+                status="blocked",
+                answer=f"⚠️ **Request Blocked by Security Guardrails**: {guard_res.user_message}",
+                plan=blocked_plan,
+                plain_language_summary=f"Query blocked by input guardrails: {guard_res.reason}",
+                planner_used=self.mode,
+                limitations=[guard_res.reason],
+            )
+            return PlanRoutingResult(
+                requested_mode=self.mode,
+                planner_used=self.mode,
+                fallback_used=False,
+                fallback_reason=None,
+                llm_configured=self._gateway_configured(),
+                general_knowledge=False,
+                deep_investigation=False,
+                followup_of=None,
+                chart=None,
+                narration=None,
+                history_entry={},
+                input_guardrail_result=guard_res,
+                result=blocked_result,
+            )
+
+        # 2. In-memory session rate limiting (evaluated before planners, LLMs, or tools)
+        effective_session_id = session_id or getattr(metadata, "session_id", None)
+        if self.rate_limiter is not None and effective_session_id:
+            is_allowed, count, retry_after = self.rate_limiter.check(
+                "question", effective_session_id, consume=True
+            )
+            if not is_allowed:
+                limit = self.rate_limiter.get_limit_for_action("question")
+                window = self.rate_limiter.get_window_for_action("question")
+                window_desc = "minute" if window <= 60.0 else "hour"
+                rate_msg = (
+                    f"Rate limit exceeded: Session '{effective_session_id}' reached the limit of "
+                    f"{limit} questions per {window_desc}. Please try again in {retry_after:.1f}s."
+                )
+                logger.warning(rate_msg)
+                blocked_plan = AnalysisPlan(
+                    intent=PlanIntent.UNSUPPORTED,
+                    confidence=0.0,
+                    unsupported_reason=rate_msg,
+                    assumptions=[f"Rate limit exceeded: {limit} questions per {window_desc}"],
+                    planner="deterministic",
+                )
+                blocked_result = QueryResult(
+                    status="blocked",
+                    answer=f"⚠️ **Rate Limit Exceeded**: {rate_msg}",
+                    plan=blocked_plan,
+                    plain_language_summary=rate_msg,
+                    planner_used=self.mode,
+                    limitations=[rate_msg],
+                )
+                return PlanRoutingResult(
+                    requested_mode=self.mode,
+                    planner_used=self.mode,
+                    fallback_used=False,
+                    fallback_reason=None,
+                    llm_configured=self._gateway_configured(),
+                    general_knowledge=False,
+                    deep_investigation=False,
+                    followup_of=None,
+                    chart=None,
+                    narration=None,
+                    history_entry={},
+                    input_guardrail_result=guard_res,
+                    result=blocked_result,
+                )
+
         schema_ctx = build_schema_context(df, metadata)
         history = list(history_ctx or [])
 
         if self.mode == MODE_LLM:
-            return self._run_llm(question, schema_ctx, df, metadata, history)
-        return self._run_rule(question, schema_ctx, df, metadata, history)
+            return self._run_llm(question, schema_ctx, df, metadata, history, guard_result=guard_res)
+        return self._run_rule(question, schema_ctx, df, metadata, history, guard_result=guard_res)
 
     def _finish(
         self,
@@ -169,6 +270,7 @@ class AnalysisPipeline:
         fallback_used: bool = False,
         fallback_reason: Optional[str] = None,
         llm_configured: bool = False,
+        input_guardrail_result: Optional[GuardrailResult] = None,
     ) -> PlanRoutingResult:
         """Post-process an executed result identically for both planner paths."""
         plan = result.plan
@@ -202,6 +304,7 @@ class AnalysisPipeline:
             chart=chart,
             narration=narration,
             history_entry=summarize_result(question, result),
+            input_guardrail_result=input_guardrail_result,
             result=result,
         )
 
@@ -212,6 +315,7 @@ class AnalysisPipeline:
         df: pd.DataFrame,
         metadata: DatasetMetadata,
         history_ctx: Optional[List[Dict[str, Any]]] = None,
+        guard_result: Optional[GuardrailResult] = None,
     ) -> PlanRoutingResult:
         """Deterministic path: RulePlanner -> PlanValidator -> PlanExecutor."""
         plan = self.rule_planner.plan(question, schema_ctx, history_ctx)
@@ -225,6 +329,7 @@ class AnalysisPipeline:
             planner_used=MODE_RULE,
             schema_ctx=schema_ctx,
             llm_configured=self._gateway_configured(),
+            input_guardrail_result=guard_result,
         )
 
     def _run_llm(
@@ -234,6 +339,7 @@ class AnalysisPipeline:
         df: pd.DataFrame,
         metadata: DatasetMetadata,
         history_ctx: Optional[List[Dict[str, Any]]] = None,
+        guard_result: Optional[GuardrailResult] = None,
     ) -> PlanRoutingResult:
         """LLM path with the explicitly configured fallback policy."""
         llm_configured = self._gateway_configured()
@@ -295,6 +401,7 @@ class AnalysisPipeline:
                     fallback_used=False,
                     fallback_reason=reason,
                     llm_configured=llm_configured,
+                    input_guardrail_result=guard_result,
                 )
 
             # Fallback policy 'rule': still answer deterministically, but disclose it.
@@ -317,6 +424,7 @@ class AnalysisPipeline:
             fallback_used=fallback_used,
             fallback_reason=fallback_reason,
             llm_configured=llm_configured,
+            input_guardrail_result=guard_result,
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -354,9 +462,20 @@ class AnalysisPipeline:
     ):
         """Return the routed, validated plan without executing it.
 
-        Useful for tests and for callers that need only the plan; execution still
-        happens exclusively through ``PlanExecutor``.
+        Guarded against malicious input before invoking any planner.
         """
+        guard_res = self.input_guardrails.validate_input(
+            question, check_scope=self.check_topic_scope
+        )
+        if not guard_res.allowed:
+            return AnalysisPlan(
+                intent=PlanIntent.UNSUPPORTED,
+                confidence=0.0,
+                unsupported_reason=guard_res.user_message or guard_res.reason,
+                assumptions=[f"Guardrail block ({guard_res.category.value}): {guard_res.reason}"],
+                planner="deterministic",
+            )
+
         history = list(history_ctx or [])
         if self.mode == MODE_LLM:
             try:

@@ -136,7 +136,7 @@ def test_regression_store_and_repository_interfaces(tmp_path):
     """Regression test for list_hypotheses, list_claims, and list_investigations on real SQLite DB."""
     db_file = str(tmp_path / "test_reg.db")
     db_mgr = DatabaseManager(db_path=db_file)
-    repo = Repository(db_manager=db_mgr)
+    repo = Repository(db_manager=db_mgr, session_id="test_reg_session")
 
     # 1. Test EvidenceStore methods
     store = EvidenceStore(dataset_id="ds_test_001", dataset_version="v1.0")

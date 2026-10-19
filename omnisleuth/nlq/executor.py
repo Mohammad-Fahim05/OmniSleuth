@@ -148,21 +148,26 @@ class PlanExecutor:
 
         # Persist results (the dataset row must exist first for the FK constraint)
         inv_id = f"inv_{metadata.dataset_id[:6]}_{uuid.uuid4().hex[:8]}"
+        sid = getattr(metadata, "session_id", None)
         try:
-            self.repo.save_dataset(metadata)
+            self.repo.save_dataset(metadata, session_id=sid)
         except Exception as exc:
             logger.warning(f"Could not persist dataset metadata for deep investigation: {exc}")
-        self.repo.save_investigation_results(
-            investigation_id=inv_id,
-            dataset_id=metadata.dataset_id,
-            question=question or "Deep diagnostic investigation",
-            status="completed",
-            plan_dict=plan.model_dump(),
-            final_answer=final_answer,
-            evidence_store=store,
-            planner_used=plan.planner,
-            summary_text="Multi-agent diagnostic investigation with automated hypothesis testing.",
-        )
+        try:
+            self.repo.save_investigation_results(
+                investigation_id=inv_id,
+                dataset_id=metadata.dataset_id,
+                question=question or "Deep diagnostic investigation",
+                status="completed",
+                plan_dict=plan.model_dump(),
+                final_answer=final_answer,
+                evidence_store=store,
+                planner_used=plan.planner,
+                summary_text="Multi-agent diagnostic investigation with automated hypothesis testing.",
+                session_id=sid,
+            )
+        except Exception as exc:
+            logger.warning(f"Could not persist deep investigation results: {exc}")
 
         return QueryResult(
             status="answered",
@@ -938,8 +943,9 @@ class PlanExecutor:
         store: EvidenceStore,
     ) -> None:
         """Persist investigation results into SQLite repository."""
+        sid = getattr(metadata, "session_id", None) or self.repo.session_id
         try:
-            self.repo.save_dataset(metadata)
+            self.repo.save_dataset(metadata, session_id=sid)
         except Exception:
             pass
         try:
@@ -951,6 +957,7 @@ class PlanExecutor:
                 plan_dict=plan.model_dump(),
                 final_answer=final_answer,
                 evidence_store=store,
+                session_id=sid,
             )
         except Exception as exc:
             logger.warning(f"Could not persist NLQ query results to SQLite: {exc}")

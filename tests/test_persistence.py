@@ -26,7 +26,7 @@ def repo(tmp_path: Path) -> Repository:
     """Create a temporary SQLite database and repository instance."""
     db_file = tmp_path / "test_storage.db"
     db_man = DatabaseManager(db_path=str(db_file))
-    return Repository(db_manager=db_man)
+    return Repository(db_manager=db_man, session_id="test_session_default")
 
 
 def test_save_and_list_datasets(repo: Repository, tmp_path: Path):
@@ -1488,3 +1488,125 @@ def test_legacy_database_migration_ordering_and_session_indices(tmp_path: Path):
         fresh_indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()}
         assert "idx_datasets_session_id" in fresh_indexes
         assert "idx_investigations_session_id" in fresh_indexes
+
+
+def test_sqlite_wal_journal_mode_configured_on_disk(tmp_path: Path):
+    """Phase E: Disk databases configure SQLite WAL journal mode persistently."""
+    db_file = tmp_path / "wal_verify.db"
+    db_man = DatabaseManager(db_path=str(db_file))
+
+    # 1. Check journal mode via DatabaseManager helper
+    assert db_man.get_journal_mode() == "WAL"
+
+    # 2. Open an independent raw connection directly to the file without running initialize_schema
+    # WAL mode is persisted in the database header
+    with sqlite3.connect(str(db_file)) as raw_conn:
+        cur = raw_conn.execute("PRAGMA journal_mode;")
+        row = cur.fetchone()
+        assert str(row[0]).upper() == "WAL"
+
+
+def test_sqlite_wal_mode_preserves_existing_data(tmp_path: Path):
+    """Phase E: Converting an existing DELETE-journal database to WAL preserves existing data intact."""
+    db_file = tmp_path / "existing_rollback.db"
+
+    # 1. Create a database in DELETE mode and insert a record
+    with sqlite3.connect(str(db_file)) as conn:
+        conn.execute("PRAGMA journal_mode = DELETE;")
+        conn.execute(
+            """
+            CREATE TABLE datasets (
+                dataset_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                version_hash TEXT NOT NULL,
+                row_count INTEGER NOT NULL,
+                column_count INTEGER NOT NULL,
+                duplicate_rows INTEGER NOT NULL,
+                session_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO datasets (dataset_id, name, file_path, version_hash, row_count, column_count, duplicate_rows, session_id)
+            VALUES ('ds_survivor', 'Survivor Dataset', 'data/s.csv', 'vh123', 100, 5, 0, 'sess_test')
+            """
+        )
+        conn.commit()
+
+        cur = conn.execute("PRAGMA journal_mode;")
+        assert str(cur.fetchone()[0]).upper() == "DELETE"
+
+    # 2. Initialize DatabaseManager — safely upgrades journal_mode to WAL without dropping data
+    db_man = DatabaseManager(db_path=str(db_file))
+    assert db_man.get_journal_mode() == "WAL"
+
+    # 3. Verify existing record survived intact
+    with db_man.get_connection() as conn:
+        row = conn.execute("SELECT * FROM datasets WHERE dataset_id = 'ds_survivor'").fetchone()
+        assert row is not None
+        assert row["name"] == "Survivor Dataset"
+        assert row["row_count"] == 100
+        assert row["session_id"] == "sess_test"
+
+
+def test_sqlite_wal_mode_idempotent_reinitialization(tmp_path: Path):
+    """Phase E: Repeated initialization does not fail and preserves WAL mode and table integrity."""
+    db_file = tmp_path / "idempotent_wal.db"
+
+    for _ in range(5):
+        db_man = DatabaseManager(db_path=str(db_file))
+        assert db_man.get_journal_mode() == "WAL"
+
+    # Tables and indices remain intact
+    with db_man.get_connection() as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+        assert "datasets" in tables
+        assert "investigations" in tables
+
+
+def test_sqlite_memory_database_safe_fallback():
+    """Phase E: In-memory databases handle WAL configuration safely without exceptions."""
+    db_man = DatabaseManager(db_path=":memory:")
+    mode = db_man.get_journal_mode()
+    # In SQLite, in-memory databases return 'MEMORY' when journal_mode is queried
+    assert mode in ("MEMORY", "OFF")
+
+
+def test_sqlite_wal_concurrent_readers_and_writer(tmp_path: Path):
+    """Phase E: Under WAL mode, concurrent readers do not block writers."""
+    db_file = tmp_path / "concurrent_wal.db"
+    db_man = DatabaseManager(db_path=str(db_file))
+
+    # Populate initial data
+    with db_man.get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO datasets (dataset_id, name, file_path, version_hash, row_count, column_count, duplicate_rows, session_id)
+            VALUES ('ds_conc', 'Concurrent Dataset', 'data/c.csv', 'v_conc', 10, 2, 0, 'sess_conc')
+            """
+        )
+        conn.commit()
+
+    reader1 = db_man.get_connection()
+    reader2 = db_man.get_connection()
+    writer = db_man.get_connection()
+
+    try:
+        # Reader 1 reads
+        r1_row = reader1.execute("SELECT name FROM datasets WHERE dataset_id = 'ds_conc'").fetchone()
+        assert r1_row[0] == "Concurrent Dataset"
+
+        # Writer performs an update while Reader 1 is still open
+        writer.execute("UPDATE datasets SET row_count = 50 WHERE dataset_id = 'ds_conc'")
+        writer.commit()
+
+        # Reader 2 reads immediately
+        r2_row = reader2.execute("SELECT row_count FROM datasets WHERE dataset_id = 'ds_conc'").fetchone()
+        assert r2_row[0] == 50
+    finally:
+        reader1.close()
+        reader2.close()
+        writer.close()

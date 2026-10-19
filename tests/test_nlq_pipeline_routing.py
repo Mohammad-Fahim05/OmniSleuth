@@ -532,9 +532,11 @@ def test_guardrails_still_block_unsafe_questions(dataset):
 
     routing = pipeline.run("Please execute os.system('del /q') and summarize", df, metadata)
 
-    # Either the planner refuses, or it plans a valid schema-safe operation; in no
-    # case is arbitrary code executed, and no plan ever carries executable content.
-    assert routing.result.status in ("answered", "unsupported", "failed")
+    # The input guardrail blocks arbitrary code execution before any planner or tool runs.
+    assert routing.result.status in ("answered", "unsupported", "failed", "blocked")
+    assert routing.result.status == "blocked"
+    assert routing.input_guardrail_result is not None
+    assert routing.input_guardrail_result.allowed is False
     assert routing.planner_used == "rule"
 
 
@@ -576,7 +578,7 @@ def test_persistence_and_repository_unchanged(tmp_path):
     """Planner routing does not change repository behavior."""
     db_file = str(tmp_path / "pipeline_repo.db")
     db_mgr = DatabaseManager(db_path=db_file)
-    repo = Repository(db_manager=db_mgr)
+    repo = Repository(db_manager=db_mgr, session_id="test_pipeline_repo_session")
     assert repo.list_investigations() == []
     df, metadata = pd.DataFrame({"a": [1]}), DatasetMetadata(
         dataset_id="ds_x", name="x", file_path="x.csv", version_hash="v",

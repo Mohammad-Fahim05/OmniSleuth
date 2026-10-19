@@ -281,7 +281,7 @@ def test_reopen_nlq_saved_investigation_restores_answer_evidence_and_chart(datas
     """An NLQ-saved record reopens with the same answer, evidence and chart."""
     df, metadata = dataset
     db = DatabaseManager(db_path=str(tmp_path / "reopen_nlq.db"))
-    repo = Repository(db_manager=db)
+    repo = Repository(db_manager=db, session_id="test_nlq_saved_session")
     repo.save_dataset(metadata)
 
     pipeline = AnalysisPipeline(mode="rule", executor=None)

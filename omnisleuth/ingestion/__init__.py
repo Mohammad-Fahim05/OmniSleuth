@@ -10,6 +10,10 @@ from omnisleuth.ingestion.storage import (
     safe_save_upload,
     sanitize_filename,
 )
+from omnisleuth.ingestion.retention import (
+    RetentionCleanupReport,
+    cleanup_expired_uploads,
+)
 from omnisleuth.ingestion.validator import DatasetValidator, validate_dataset_file
 
 DatasetLoader = CSVLoader
@@ -28,4 +32,6 @@ __all__ = [
     "is_safe_path_contained",
     "safe_save_upload",
     "safe_cleanup_file",
+    "RetentionCleanupReport",
+    "cleanup_expired_uploads",
 ]

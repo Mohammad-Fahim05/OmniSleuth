@@ -22,6 +22,7 @@ class CSVLoader:
         self,
         schema_detector: Optional[SchemaDetector] = None,
         max_file_size_bytes: Optional[int] = None,
+        max_rows: Optional[int] = None,
     ):
         self.schema_detector = schema_detector or SchemaDetector()
         if max_file_size_bytes is not None:
@@ -34,7 +35,10 @@ class CSVLoader:
             except Exception:
                 self.max_file_size_bytes = 50 * 1024 * 1024
 
-        self.validator = DatasetValidator(max_file_size_bytes=self.max_file_size_bytes)
+        self.validator = DatasetValidator(
+            max_file_size_bytes=self.max_file_size_bytes,
+            max_rows=max_rows,
+        )
 
     def calculate_file_hash(self, file_path: Union[str, Path]) -> str:
         """Calculate SHA-256 hash of the raw file content for version tracking."""
@@ -93,6 +97,21 @@ class CSVLoader:
                     raise IngestionError(
                         "Parquet engine (pyarrow or fastparquet) is required to read Parquet files."
                     )
+            # Safe bounded pre-check via Parquet file metadata before loading into memory
+            if self.validator.max_rows is not None:
+                try:
+                    import pyarrow.parquet as pq
+                    pq_meta = pq.read_metadata(path)
+                    if pq_meta.num_rows > self.validator.max_rows:
+                        raise IngestionError(
+                            f"Dataset file '{name}' exceeds maximum allowed row count "
+                            f"({pq_meta.num_rows:,} > {self.validator.max_rows:,} rows)."
+                        )
+                except IngestionError:
+                    raise
+                except Exception:
+                    pass
+
             try:
                 df = pd.read_parquet(path)
             except Exception as exc:
@@ -103,6 +122,26 @@ class CSVLoader:
                 import openpyxl  # type: ignore # noqa: F401
             except ImportError:
                 raise IngestionError("Excel engine (openpyxl) is required to read .xlsx files.")
+
+            # Bounded pre-check via read-only workbook inspection before full DataFrame generation
+            if self.validator.max_rows is not None:
+                try:
+                    wb = openpyxl.load_workbook(path, read_only=True)
+                    ws = wb.active
+                    if ws is not None and ws.max_row is not None and ws.max_row > 1:
+                        data_rows = ws.max_row - 1
+                        if data_rows > self.validator.max_rows:
+                            wb.close()
+                            raise IngestionError(
+                                f"Dataset file '{name}' exceeds maximum allowed row count "
+                                f"({data_rows:,} > {self.validator.max_rows:,} rows)."
+                            )
+                    wb.close()
+                except IngestionError:
+                    raise
+                except Exception:
+                    pass
+
             try:
                 df = pd.read_excel(path, engine="openpyxl")
             except Exception as exc:
@@ -112,11 +151,38 @@ class CSVLoader:
             # Try reading with standard encodings for CSV
             encodings = ["utf-8", "utf-8-sig", "latin-1", "cp1252"]
             last_exc: Optional[Exception] = None
+            max_allowed = self.validator.max_rows
 
             for encoding in encodings:
                 try:
-                    df = pd.read_csv(path, encoding=encoding)
+                    if max_allowed is not None:
+                        # Stream in bounded chunks to avoid loading unbounded rows into memory
+                        chunksize = min(100_000, max_allowed + 1)
+                        reader = pd.read_csv(path, encoding=encoding, chunksize=chunksize)
+                        chunks = []
+                        total_rows = 0
+                        try:
+                            for chunk in reader:
+                                total_rows += len(chunk)
+                                if total_rows > max_allowed:
+                                    raise IngestionError(
+                                        f"Dataset file '{name}' exceeds maximum allowed row count "
+                                        f"({total_rows:,} > {max_allowed:,} rows)."
+                                    )
+                                chunks.append(chunk)
+                        finally:
+                            if hasattr(reader, "close"):
+                                reader.close()
+
+                        if chunks:
+                            df = pd.concat(chunks, ignore_index=True) if len(chunks) > 1 else chunks[0]
+                        else:
+                            df = pd.DataFrame()
+                    else:
+                        df = pd.read_csv(path, encoding=encoding)
                     break
+                except IngestionError:
+                    raise
                 except (UnicodeDecodeError, pd.errors.ParserError) as exc:
                     last_exc = exc
                     continue

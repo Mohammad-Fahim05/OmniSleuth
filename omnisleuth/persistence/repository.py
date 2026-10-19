@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
-from omnisleuth.core.exceptions import IngestionError
+from omnisleuth.core.exceptions import AccessDeniedError, IngestionError
 from omnisleuth.core.logging import get_logger
 from omnisleuth.evidence.models import (
     Claim,
@@ -23,10 +23,32 @@ logger = get_logger("persistence.repository")
 
 
 class Repository:
-    """Provides high-level transactional persistence operations."""
+    """Provides high-level transactional persistence operations with fail-closed session isolation."""
 
-    def __init__(self, db_manager: Optional[DatabaseManager] = None):
+    def __init__(
+        self,
+        db_manager: Optional[DatabaseManager] = None,
+        session_id: Optional[str] = None,
+    ):
         self.db = db_manager or DatabaseManager()
+        self.session_id = session_id
+
+    def scoped(self, session_id: str) -> "Repository":
+        """Return a scoped Repository instance bound to the specified session_id."""
+        return Repository(db_manager=self.db, session_id=session_id)
+
+    def _resolve_session_id(self, session_id: Optional[str] = None, operation: str = "operation") -> str:
+        """Resolve effective session_id, failing closed with AccessDeniedError if missing or empty.
+
+        Raises:
+            AccessDeniedError: If no valid session context is available.
+        """
+        sid = session_id or self.session_id
+        if not sid or not sid.strip():
+            raise AccessDeniedError(
+                f"Access denied: Valid session context is required for {operation}."
+            )
+        return sid.strip()
 
     def save_dataset(
         self,
@@ -47,7 +69,7 @@ class Repository:
         Raises:
             IngestionError: If file validation, ownership verification, or database persistence fails.
         """
-        owner_session = session_id or getattr(metadata, "session_id", None)
+        owner_session = session_id or getattr(metadata, "session_id", None) or self.session_id
         path = Path(metadata.file_path)
 
         # Enforce cross-session authorization: foreign session cannot overwrite an existing dataset
@@ -57,7 +79,7 @@ class Repository:
             if existing_row:
                 existing_session = existing_row["session_id"]
                 if existing_session is not None and existing_session != owner_session:
-                    raise IngestionError(
+                    raise AccessDeniedError(
                         f"Access denied: Dataset '{metadata.dataset_id}' belongs to another session."
                     )
 
@@ -116,24 +138,25 @@ class Repository:
         check_file: bool = True,
         session_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Fetch dataset record by ID, optionally validating file existence and session ownership.
+        """Fetch dataset record by ID, strictly enforcing session ownership.
 
         Args:
             dataset_id: Unique dataset identifier.
             check_file: If True, checks whether the referenced file exists and sets 'file_exists'.
-            session_id: If provided, enforces that dataset belongs to this session.
+            session_id: Optional session identifier override.
 
         Returns:
-            Dictionary representing dataset row or None if not found or inaccessible.
+            Dictionary representing dataset row or None if not found or unauthorized.
+
+        Raises:
+            AccessDeniedError: If no valid session context is available.
         """
+        sid = self._resolve_session_id(session_id, operation=f"get_dataset('{dataset_id}')")
         with self.db.get_connection() as conn:
-            if session_id is not None:
-                cur = conn.execute(
-                    "SELECT * FROM datasets WHERE dataset_id = ? AND session_id = ?",
-                    (dataset_id, session_id),
-                )
-            else:
-                cur = conn.execute("SELECT * FROM datasets WHERE dataset_id = ?", (dataset_id,))
+            cur = conn.execute(
+                "SELECT * FROM datasets WHERE dataset_id = ? AND session_id = ?",
+                (dataset_id, sid),
+            )
             row = cur.fetchone()
             if not row:
                 return None
@@ -147,16 +170,20 @@ class Repository:
         dataset_id: str,
         session_id: Optional[str] = None,
     ) -> Optional[DatasetMetadata]:
-        """Reconstruct DatasetMetadata from SQLite descriptor and schema version without reparsing the file.
+        """Reconstruct DatasetMetadata from SQLite descriptor and schema version with session ownership.
 
         Args:
             dataset_id: Unique dataset identifier.
-            session_id: If provided, enforces session ownership.
+            session_id: Optional session identifier override.
 
         Returns:
-            Reconstructed DatasetMetadata instance or None if not found or inaccessible.
+            Reconstructed DatasetMetadata instance or None if not found or unauthorized.
+
+        Raises:
+            AccessDeniedError: If no valid session context is available.
         """
-        record = self.get_dataset(dataset_id, check_file=False, session_id=session_id)
+        sid = self._resolve_session_id(session_id, operation=f"get_dataset_metadata('{dataset_id}')")
+        record = self.get_dataset(dataset_id, check_file=False, session_id=sid)
         if not record:
             return None
 
@@ -191,20 +218,22 @@ class Repository:
         dataset_id: str,
         session_id: Optional[str] = None,
     ) -> Tuple[Any, DatasetMetadata]:
-        """Verify underlying file and lazily load DataFrame for a persisted dataset.
+        """Verify underlying file and lazily load DataFrame for a persisted dataset with session ownership.
 
         Args:
             dataset_id: Unique dataset identifier.
-            session_id: If provided, enforces session ownership.
+            session_id: Optional session identifier override.
 
         Returns:
             Tuple of (DataFrame, DatasetMetadata).
 
         Raises:
+            AccessDeniedError: If session context is missing.
             IngestionError: If dataset is missing, file does not exist, or file is unreadable.
         """
-        path = self.verify_dataset_file(dataset_id, session_id=session_id)
-        metadata = self.get_dataset_metadata(dataset_id, session_id=session_id)
+        sid = self._resolve_session_id(session_id, operation=f"load_dataset_dataframe('{dataset_id}')")
+        path = self.verify_dataset_file(dataset_id, session_id=sid)
+        metadata = self.get_dataset_metadata(dataset_id, session_id=sid)
         if not metadata:
             raise IngestionError(f"Dataset '{dataset_id}' metadata not found in database.")
 
@@ -215,26 +244,28 @@ class Repository:
             file_path=path,
             dataset_name=metadata.name,
             parse_dates=True,
-            session_id=session_id,
+            session_id=sid,
         )
         return df, metadata
 
     def verify_dataset_file(self, dataset_id: str, session_id: Optional[str] = None) -> Path:
-        """Verify that a registered dataset's file exists and is readable.
+        """Verify that a registered dataset's file exists and is readable for the authorized session.
 
         Args:
             dataset_id: Unique dataset identifier.
-            session_id: If provided, enforces that dataset belongs to this session.
+            session_id: Optional session identifier override.
 
         Returns:
             Verified Path to the dataset file.
 
         Raises:
+            AccessDeniedError: If session context is missing.
             IngestionError: If dataset record is missing, inaccessible, or file does not exist or cannot be read.
         """
-        dataset = self.get_dataset(dataset_id, check_file=False, session_id=session_id)
+        sid = self._resolve_session_id(session_id, operation=f"verify_dataset_file('{dataset_id}')")
+        dataset = self.get_dataset(dataset_id, check_file=False, session_id=sid)
         if not dataset:
-            raise IngestionError(f"Dataset '{dataset_id}' not found in database.")
+            raise IngestionError(f"Dataset '{dataset_id}' not found in database or belongs to another session.")
 
         path = Path(dataset["file_path"])
         if not path.exists() or not path.is_file():
@@ -250,23 +281,24 @@ class Repository:
         check_files: bool = True,
         session_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Retrieve registered datasets, optionally filtered by session owner.
+        """Retrieve registered datasets strictly scoped to the active session owner.
 
         Args:
             check_files: If True, annotates each record with 'file_exists' boolean.
-            session_id: If provided, only returns datasets belonging to this session.
+            session_id: Optional session identifier override.
 
         Returns:
-            List of dataset records.
+            List of dataset records belonging to the session.
+
+        Raises:
+            AccessDeniedError: If no valid session context is available.
         """
+        sid = self._resolve_session_id(session_id, operation="list_datasets")
         with self.db.get_connection() as conn:
-            if session_id is not None:
-                cursor = conn.execute(
-                    "SELECT * FROM datasets WHERE session_id = ? ORDER BY created_at DESC",
-                    (session_id,),
-                )
-            else:
-                cursor = conn.execute("SELECT * FROM datasets ORDER BY created_at DESC")
+            cursor = conn.execute(
+                "SELECT * FROM datasets WHERE session_id = ? ORDER BY created_at DESC",
+                (sid,),
+            )
             results = []
             for row in cursor.fetchall():
                 d = dict(row)
@@ -281,27 +313,30 @@ class Repository:
         delete_file: bool = True,
         session_id: Optional[str] = None,
     ) -> bool:
-        """Atomically delete a dataset and optionally remove its stored file if owned by session.
+        """Atomically delete a dataset and its child investigation records if owned by session.
 
         Args:
             dataset_id: ID of the dataset to remove.
             delete_file: If True, safely removes the stored file if it is in uploads_dir.
-            session_id: If provided, verifies ownership before deletion.
+            session_id: Optional session identifier override.
 
         Returns:
             True if dataset was found and deleted, False otherwise.
         """
-        dataset = self.get_dataset(dataset_id, check_file=False, session_id=session_id)
-        if not dataset:
+        sid = session_id or self.session_id
+        if not sid or not sid.strip():
             return False
 
-        # Enforce session ownership: unowned request or mismatched session cannot delete owned dataset
-        if dataset.get("session_id") is not None and (session_id is None or session_id != dataset["session_id"]):
+        dataset = self.get_dataset(dataset_id, check_file=False, session_id=sid)
+        if not dataset:
             return False
 
         with self.db.get_connection() as conn:
             # Cascade deletion of child investigation records (tool executions, evidence, hypotheses, claims)
-            cur = conn.execute("SELECT investigation_id FROM investigations WHERE dataset_id = ?", (dataset_id,))
+            cur = conn.execute(
+                "SELECT investigation_id FROM investigations WHERE dataset_id = ? AND session_id = ?",
+                (dataset_id, sid),
+            )
             inv_ids = [row["investigation_id"] for row in cur.fetchall()]
             for inv_id in inv_ids:
                 conn.execute("DELETE FROM tool_executions WHERE investigation_id = ?", (inv_id,))
@@ -310,14 +345,14 @@ class Repository:
                 conn.execute("DELETE FROM claims WHERE investigation_id = ?", (inv_id,))
 
             conn.execute("DELETE FROM dataset_versions WHERE dataset_id = ?", (dataset_id,))
-            conn.execute("DELETE FROM investigations WHERE dataset_id = ?", (dataset_id,))
-            conn.execute("DELETE FROM datasets WHERE dataset_id = ?", (dataset_id,))
+            conn.execute("DELETE FROM investigations WHERE dataset_id = ? AND session_id = ?", (dataset_id, sid))
+            conn.execute("DELETE FROM datasets WHERE dataset_id = ? AND session_id = ?", (dataset_id, sid))
             conn.commit()
 
         if delete_file and dataset.get("file_path"):
             safe_cleanup_file(dataset["file_path"])
 
-        logger.info(f"Deleted dataset '{dataset['name']}' ({dataset_id})")
+        logger.info(f"Deleted dataset '{dataset['name']}' ({dataset_id}) [session={sid}]")
         return True
 
     def list_investigations(
@@ -325,30 +360,24 @@ class Repository:
         dataset_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Retrieve registered investigations, optionally filtered by dataset and session."""
+        """Retrieve registered investigations strictly scoped to the active session owner.
+
+        Raises:
+            AccessDeniedError: If no valid session context is available.
+        """
+        sid = self._resolve_session_id(session_id, operation="list_investigations")
         with self.db.get_connection() as conn:
-            if dataset_id and session_id is not None:
+            if dataset_id:
                 cur = conn.execute(
                     "SELECT investigation_id, dataset_id, question, status, created_at, session_id "
                     "FROM investigations WHERE dataset_id = ? AND session_id = ? ORDER BY created_at DESC",
-                    (dataset_id, session_id),
-                )
-            elif dataset_id:
-                cur = conn.execute(
-                    "SELECT investigation_id, dataset_id, question, status, created_at, session_id "
-                    "FROM investigations WHERE dataset_id = ? ORDER BY created_at DESC",
-                    (dataset_id,),
-                )
-            elif session_id is not None:
-                cur = conn.execute(
-                    "SELECT investigation_id, dataset_id, question, status, created_at, session_id "
-                    "FROM investigations WHERE session_id = ? ORDER BY created_at DESC",
-                    (session_id,),
+                    (dataset_id, sid),
                 )
             else:
                 cur = conn.execute(
                     "SELECT investigation_id, dataset_id, question, status, created_at, session_id "
-                    "FROM investigations ORDER BY created_at DESC"
+                    "FROM investigations WHERE session_id = ? ORDER BY created_at DESC",
+                    (sid,),
                 )
             return [dict(row) for row in cur.fetchall()]
 
@@ -368,20 +397,14 @@ class Repository:
         session_id: Optional[str] = None,
     ) -> None:
         """Atomically persist investigation run, executions, evidence, hypotheses, and claims with session isolation."""
-        # Enforce target dataset ownership if session_id is specified
-        if session_id is not None:
-            ds = self.get_dataset(dataset_id, check_file=False, session_id=session_id)
-            if not ds:
-                raise IngestionError(
-                    f"Access denied: Target dataset '{dataset_id}' not found in current session."
-                )
-        else:
-            # Inherit session_id from dataset record if available
-            with self.db.get_connection() as conn:
-                cur = conn.execute("SELECT session_id FROM datasets WHERE dataset_id = ?", (dataset_id,))
-                r = cur.fetchone()
-                if r and r["session_id"]:
-                    session_id = r["session_id"]
+        sid = self._resolve_session_id(session_id, operation=f"save_investigation_results('{investigation_id}')")
+
+        # Enforce target dataset ownership
+        ds = self.get_dataset(dataset_id, check_file=False, session_id=sid)
+        if not ds:
+            raise AccessDeniedError(
+                f"Access denied: Target dataset '{dataset_id}' not found in current session."
+            )
 
         with self.db.get_connection() as conn:
             # Enforce investigation ownership: foreign session cannot overwrite an existing investigation
@@ -389,8 +412,8 @@ class Repository:
             inv_row = cur.fetchone()
             if inv_row:
                 existing_inv_session = inv_row["session_id"]
-                if existing_inv_session is not None and existing_inv_session != session_id:
-                    raise IngestionError(
+                if existing_inv_session is not None and existing_inv_session != sid:
+                    raise AccessDeniedError(
                         f"Access denied: Investigation '{investigation_id}' belongs to another session."
                     )
 
@@ -413,7 +436,7 @@ class Repository:
                     safe_json_dumps(chart_spec) if chart_spec else None,
                     planner_used,
                     summary_text,
-                    session_id,
+                    sid,
                 ),
             )
 
@@ -493,22 +516,20 @@ class Repository:
                 )
 
             conn.commit()
-        logger.info(f"Persisted investigation '{investigation_id}' with {len(evidence_store.list_evidence())} evidence items.")
+        logger.info(f"Persisted investigation '{investigation_id}' with {len(evidence_store.list_evidence())} evidence items [session={sid}].")
 
     def get_investigation(
         self,
         investigation_id: str,
         session_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Fetch investigation record and associated evidence items, optionally enforcing session ownership."""
+        """Fetch investigation record and associated evidence items strictly verifying session ownership."""
+        sid = self._resolve_session_id(session_id, operation=f"get_investigation('{investigation_id}')")
         with self.db.get_connection() as conn:
-            if session_id is not None:
-                cur = conn.execute(
-                    "SELECT * FROM investigations WHERE investigation_id = ? AND session_id = ?",
-                    (investigation_id, session_id),
-                )
-            else:
-                cur = conn.execute("SELECT * FROM investigations WHERE investigation_id = ?", (investigation_id,))
+            cur = conn.execute(
+                "SELECT * FROM investigations WHERE investigation_id = ? AND session_id = ?",
+                (investigation_id, sid),
+            )
             inv_row = cur.fetchone()
             if not inv_row:
                 return None
@@ -518,7 +539,7 @@ class Repository:
             res["result_table"] = safe_json_loads(res.get("result_table_json"), default=None)
             res["chart_spec"] = safe_json_loads(res.get("chart_spec_json"), default=None)
 
-            # Evidence items
+            # Parent ownership verified: safely fetch child records
             cur_ev = conn.execute("SELECT * FROM evidence_items WHERE investigation_id = ?", (investigation_id,))
             ev_list = []
             for r in cur_ev.fetchall():
@@ -554,7 +575,7 @@ class Repository:
     ) -> Optional[Dict[str, Any]]:
         """Reconstruct investigation state including EvidenceStore, hypotheses, and claims defensively.
 
-        Ensures session ownership if session_id is provided. Corrupted or malformed
+        Ensures session ownership. Corrupted or malformed
         evidence/hypotheses/claims are skipped or set to safe defaults without crashing rehydration.
 
         Args:
@@ -563,13 +584,17 @@ class Repository:
 
         Returns:
             Dictionary of reconstructed investigation state, or None if not found or unauthorized.
+
+        Raises:
+            AccessDeniedError: If session context is missing.
         """
-        inv = self.get_investigation(investigation_id, session_id=session_id)
+        sid = self._resolve_session_id(session_id, operation=f"reconstruct_investigation_state('{investigation_id}')")
+        inv = self.get_investigation(investigation_id, session_id=sid)
         if not inv:
             return None
 
         dataset_id = inv.get("dataset_id", "")
-        ds_meta = self.get_dataset_metadata(dataset_id, session_id=session_id) if dataset_id else None
+        ds_meta = self.get_dataset_metadata(dataset_id, session_id=sid) if dataset_id else None
         version_hash = ds_meta.version_hash if ds_meta else "unknown"
 
         store = EvidenceStore(dataset_id=dataset_id, dataset_version=version_hash)
@@ -674,3 +699,143 @@ class Repository:
             "chart_spec": inv.get("chart_spec"),
             "session_id": inv.get("session_id"),
         }
+
+    # ─────────────────────────────────────────────────────────────
+    # Explicit Administrative Operations (Internal Maintenance Only)
+    # ─────────────────────────────────────────────────────────────
+
+    def admin_list_all_datasets(self, check_files: bool = True) -> List[Dict[str, Any]]:
+        """Administrative unscoped listing of all datasets for maintenance or audit."""
+        with self.db.get_connection() as conn:
+            cursor = conn.execute("SELECT * FROM datasets ORDER BY created_at DESC")
+            results = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                if check_files:
+                    d["file_exists"] = Path(d["file_path"]).is_file()
+                results.append(d)
+            return results
+
+    def admin_get_dataset(self, dataset_id: str, check_file: bool = True) -> Optional[Dict[str, Any]]:
+        """Administrative unscoped retrieval of a dataset record by ID."""
+        with self.db.get_connection() as conn:
+            cur = conn.execute("SELECT * FROM datasets WHERE dataset_id = ?", (dataset_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            res = dict(row)
+            if check_file:
+                res["file_exists"] = Path(res["file_path"]).is_file()
+            return res
+
+    def admin_get_dataset_metadata(self, dataset_id: str) -> Optional[DatasetMetadata]:
+        """Administrative unscoped retrieval of DatasetMetadata."""
+        record = self.admin_get_dataset(dataset_id, check_file=False)
+        if not record:
+            return None
+
+        with self.db.get_connection() as conn:
+            cur = conn.execute(
+                "SELECT schema_json FROM dataset_versions WHERE dataset_id = ? AND version_hash = ?",
+                (dataset_id, record["version_hash"]),
+            )
+            ver_row = cur.fetchone()
+            columns = []
+            if ver_row and ver_row["schema_json"]:
+                try:
+                    raw_cols = safe_json_loads(ver_row["schema_json"], default=[])
+                    columns = [ColumnSchema(**c) for c in raw_cols]
+                except Exception as exc:
+                    logger.warning(f"Could not parse stored schema_json for '{dataset_id}': {exc}")
+
+            return DatasetMetadata(
+                dataset_id=record["dataset_id"],
+                name=record["name"],
+                file_path=record["file_path"],
+                version_hash=record["version_hash"],
+                row_count=record["row_count"],
+                column_count=record["column_count"],
+                duplicate_rows=record["duplicate_rows"],
+                columns=columns,
+                session_id=record.get("session_id"),
+            )
+
+    def admin_list_all_investigations(self, dataset_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Administrative unscoped listing of all investigations."""
+        with self.db.get_connection() as conn:
+            if dataset_id:
+                cur = conn.execute(
+                    "SELECT investigation_id, dataset_id, question, status, created_at, session_id "
+                    "FROM investigations WHERE dataset_id = ? ORDER BY created_at DESC",
+                    (dataset_id,),
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT investigation_id, dataset_id, question, status, created_at, session_id "
+                    "FROM investigations ORDER BY created_at DESC"
+                )
+            return [dict(row) for row in cur.fetchall()]
+
+    def admin_get_investigation(self, investigation_id: str) -> Optional[Dict[str, Any]]:
+        """Administrative unscoped retrieval of an investigation record and its child records."""
+        with self.db.get_connection() as conn:
+            cur = conn.execute("SELECT * FROM investigations WHERE investigation_id = ?", (investigation_id,))
+            inv_row = cur.fetchone()
+            if not inv_row:
+                return None
+
+            res = dict(inv_row)
+            res["plan"] = safe_json_loads(res.get("plan_json"), default={})
+            res["result_table"] = safe_json_loads(res.get("result_table_json"), default=None)
+            res["chart_spec"] = safe_json_loads(res.get("chart_spec_json"), default=None)
+
+            cur_ev = conn.execute("SELECT * FROM evidence_items WHERE investigation_id = ?", (investigation_id,))
+            ev_list = []
+            for r in cur_ev.fetchall():
+                ev_d = dict(r)
+                ev_d["content"] = safe_json_loads(ev_d.get("content_json"), default={})
+                ev_list.append(ev_d)
+            res["evidence_items"] = ev_list
+
+            cur_hyp = conn.execute("SELECT * FROM hypotheses WHERE investigation_id = ?", (investigation_id,))
+            res["hypotheses"] = [dict(r) for r in cur_hyp.fetchall()]
+
+            cur_clm = conn.execute("SELECT * FROM claims WHERE investigation_id = ?", (investigation_id,))
+            res["claims"] = [dict(r) for r in cur_clm.fetchall()]
+
+            cur_tool = conn.execute("SELECT * FROM tool_executions WHERE investigation_id = ?", (investigation_id,))
+            tool_list = []
+            for r in cur_tool.fetchall():
+                td = dict(r)
+                td["parameters"] = safe_json_loads(td.get("parameters_json"), default={})
+                td["result"] = safe_json_loads(td.get("result_json"), default=None)
+                tool_list.append(td)
+            res["tool_executions"] = tool_list
+
+            return res
+
+    def admin_delete_dataset(self, dataset_id: str, delete_file: bool = True) -> bool:
+        """Administrative unscoped dataset deletion."""
+        dataset = self.admin_get_dataset(dataset_id, check_file=False)
+        if not dataset:
+            return False
+
+        with self.db.get_connection() as conn:
+            cur = conn.execute("SELECT investigation_id FROM investigations WHERE dataset_id = ?", (dataset_id,))
+            inv_ids = [row["investigation_id"] for row in cur.fetchall()]
+            for inv_id in inv_ids:
+                conn.execute("DELETE FROM tool_executions WHERE investigation_id = ?", (inv_id,))
+                conn.execute("DELETE FROM evidence_items WHERE investigation_id = ?", (inv_id,))
+                conn.execute("DELETE FROM hypotheses WHERE investigation_id = ?", (inv_id,))
+                conn.execute("DELETE FROM claims WHERE investigation_id = ?", (inv_id,))
+
+            conn.execute("DELETE FROM dataset_versions WHERE dataset_id = ?", (dataset_id,))
+            conn.execute("DELETE FROM investigations WHERE dataset_id = ?", (dataset_id,))
+            conn.execute("DELETE FROM datasets WHERE dataset_id = ?", (dataset_id,))
+            conn.commit()
+
+        if delete_file and dataset.get("file_path"):
+            safe_cleanup_file(dataset["file_path"])
+
+        logger.info(f"[ADMIN] Deleted dataset '{dataset['name']}' ({dataset_id})")
+        return True

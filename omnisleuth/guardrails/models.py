@@ -19,6 +19,7 @@ class GuardrailCategory(str, Enum):
     MISSING_EVIDENCE = "missing_evidence"
     UNSUPPORTED_CAUSALITY = "unsupported_causality"
     INVALID_OUTPUT = "invalid_output"
+    INVALID_INPUT = "invalid_input"
 
 
 class GuardrailSeverity(str, Enum):
