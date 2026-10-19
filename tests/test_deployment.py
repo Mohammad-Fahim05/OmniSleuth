@@ -39,6 +39,10 @@ def test_dockerfile_exists_and_security_configuration():
     assert req_pos != -1 and src_pos != -1, "Both requirements and source code must be copied."
     assert req_pos < src_pos, "Requirements must be copied and installed prior to copying full source."
 
+    # 7. Entrypoint supports CLI argument passthrough
+    assert 'exec "$@"' in content or 'exec \\"$@\\"' in content, "Dockerfile ENTRYPOINT must support CLI argument passthrough."
+
+
 
 def test_dockerignore_exclusions():
     """Verify .dockerignore exists and excludes build caches, virtualenvs, secrets, and logs."""

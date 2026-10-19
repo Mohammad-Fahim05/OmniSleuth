@@ -56,5 +56,6 @@ EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl --fail http://localhost:${PORT:-8501}/_stcore/health || exit 1
 
-# Launch Streamlit with dynamic Cloud Run $PORT and 0.0.0.0 address binding
-ENTRYPOINT ["sh", "-c", "exec streamlit run omnisleuth/ui/app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false"]
+# Launch Streamlit with dynamic Cloud Run $PORT and 0.0.0.0 address binding, or pass through CLI command
+ENTRYPOINT ["sh", "-c", "if [ $# -eq 0 ]; then exec streamlit run omnisleuth/ui/app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false; else exec \"$@\"; fi", "--"]
+
