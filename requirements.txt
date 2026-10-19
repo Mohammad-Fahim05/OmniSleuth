@@ -24,3 +24,6 @@ pypdf>=4.0.0
 
 # UI (for Phase 15)
 streamlit>=1.32.0
+
+# Editable install of root package for Streamlit Community Cloud
+-e .
