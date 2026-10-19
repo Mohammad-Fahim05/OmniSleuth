@@ -153,8 +153,10 @@ Located in [`omnisleuth/ingestion/`](file:///d:/OmniSleuth/omnisleuth/ingestion/
 Located in [`omnisleuth/persistence/`](file:///d:/OmniSleuth/omnisleuth/persistence/):
 
 - **Database Engine:** SQLite accessed via standard library `sqlite3`.
-- **Concurrency & Locking:** Connection configured with `PRAGMA busy_timeout = 30000;` (30 seconds) to prevent database locking errors during concurrent reads/writes.
-- **Foreign Key Integrity:** `PRAGMA foreign_keys = ON;`.
+- **Journal Mode (WAL):** Configured via `PRAGMA journal_mode = WAL;` during database initialization in `DatabaseManager.initialize_schema()`. SQLite persists WAL mode in the database file header so all future connections benefit from write-ahead logging without per-query pragma overhead.
+- **Concurrency & Locking:** Connection configured with `PRAGMA busy_timeout = 30000;` (30 seconds) and `PRAGMA foreign_keys = ON;`. In WAL mode, readers do not block writers and writers do not block readers.
+- **WAL Sidecar Files:** SQLite creates `<dbname>-wal` (write-ahead log) and `<dbname>-shm` (shared-memory index) sidecars alongside the database. Persistent volume mounts (`/app/data/`) must encompass these sidecar files.
+- **Single-Host Limitation:** SQLite WAL relies on shared memory and local filesystem advisory locks; it cannot be shared across multiple distributed application replicas or network filesystems without corruption risk.
 - **Schema Evolution:** Non-destructive additive migrations (`DatabaseManager._apply_additive_migrations`) automatically add required columns (such as `session_id`, `result_table_json`, `chart_spec_json`) if absent, without dropping tables or losing historical data.
 - **Session Isolation:** All datasets and investigations are tagged with an opaque pseudonymous `session_id`. `Repository` methods filter queries by `session_id`, preventing cross-session data leakage or unauthorized dataset deletion.
 

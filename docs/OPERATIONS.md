@@ -106,13 +106,20 @@ pytest -q -p no:cacheprovider
 
 ### Storage File Locations
 - **SQLite Database:** `data/omnisleuth.db` (Configurable via `SQLITE_DB_PATH`)
+- **WAL Sidecar Files:** `data/omnisleuth.db-wal` (write-ahead log) and `data/omnisleuth.db-shm` (shared-memory index)
 - **Uploaded Datasets:** `data/uploads/` (Configurable via `UPLOADS_DIR`)
 - **Application Logs:** `logs/omnisleuth.log` (Configurable via `LOG_FILE`)
 
+### SQLite WAL Mode & Concurrency
+- `DatabaseManager.initialize_schema()` automatically configures disk databases in Write-Ahead Logging mode (`PRAGMA journal_mode = WAL;`).
+- SQLite stores the WAL setting permanently in the database header; all subsequent connections operate in WAL mode.
+- In WAL mode, concurrent readers do not block writers, and writers do not block readers.
+- **Single-Host Limitation:** WAL mode relies on POSIX shared memory (`.shm`) and advisory file locking that require a single host operating system. SQLite databases cannot be mounted read-write across multiple distributed container replicas or over network filesystems (NFS/CIFS/SMB).
+
 ### Online SQLite Backup (Without Stopping Application)
-SQLite supports safe online snapshots using the `.backup` command:
+Because SQLite in WAL mode writes transactions to `omnisleuth.db-wal`, a raw filesystem copy (`cp data/omnisleuth.db ...`) while the application is active can create an inconsistent or torn backup. Always use the SQLite `.backup` API to create a point-in-time consistent snapshot:
 ```powershell
-# Create timestamped database backup
+# Create timestamped database backup (safely flushes and snapshots WAL state)
 sqlite3 data/omnisleuth.db ".backup 'data/backup_omnisleuth.db'"
 ```
 
@@ -121,6 +128,24 @@ sqlite3 data/omnisleuth.db ".backup 'data/backup_omnisleuth.db'"
 # Archive upload directory
 tar -czvf uploads_backup.tar.gz data/uploads/
 ```
+
+### Upload Retention & Cleanup Operations
+Upload files are retained according to the configured retention policy (`UPLOAD_RETENTION_DAYS`, default 30 days).
+
+Cleanup is **not** performed automatically during application startup to avoid unreviewed bulk file deletions. Administrators can preview or invoke retention cleanup using the CLI:
+
+```powershell
+# 1. Preview expired files eligible for cleanup (safe dry-run mode)
+python -m omnisleuth.cli cleanup-uploads --days 30
+
+# 2. Execute cleanup and delete unreferenced expired files
+python -m omnisleuth.cli cleanup-uploads --days 30 --apply
+```
+
+**Retention Cleanup Rules:**
+- Only files strictly contained inside `data/uploads/` are scanned; path traversal and exterior paths are rejected.
+- Files actively referenced in the SQLite database (`datasets` table) are automatically preserved to protect repository integrity.
+- Cleanup is idempotent; running it repeatedly causes no errors or inconsistent state.
 
 ### Database Restore Procedure
 1. Stop the Streamlit application.
@@ -134,11 +159,16 @@ tar -czvf uploads_backup.tar.gz data/uploads/
 
 ## 6. Container Deployment Status & Instructions
 
-> [!NOTE]
-> **Host Environment Status (T-007 Audit):**
-> The Docker CLI is installed on this host (`Docker version 28.5.1`). However, the Docker Desktop daemon service (`com.docker.service`) was in a `Stopped` state and requires Windows Administrator elevation to start. Therefore, static container configurations (`Dockerfile`, `.dockerignore`, `docker-compose.yml`) have been verified, but actual runtime container execution awaits administrator daemon startup.
+### Container Security & Permissions Verified
+- **Non-Root Execution:** The container runs under a dedicated unprivileged user (`appuser`, UID/GID 10001).
+- **Filesystem Permissions:** The container root filesystem is writable in standard Compose deployment. `read_only: true` is not currently enabled because Streamlit, Python cache, logging, and temporary directories require write access. For production hardening with `read_only: true`, operators must supply `tmpfs` mounts for `/tmp`, `/app/logs`, and `/home/appuser/.streamlit`.
+- **Persistent Volume Mounts:**
+  - `./data:/app/data` (persists SQLite database, WAL/SHM sidecars, and uploads directory). On Linux hosts, ensure host permissions allow UID 10001 write access.
+  - `./persisted_data:/app/persisted_data` (persists alternate database storage).
+- **Port Mapping:** Host port 8501 maps to container port 8501 (`8501:8501`).
+- **Health Check:** Validates Streamlit internal health via `curl --fail http://localhost:8501/_stcore/health || exit 1`.
 
-### Docker Build Command (Once Daemon is Active)
+### Docker Build Command
 ```bash
 docker build -t omnisleuth:latest .
 ```
@@ -153,6 +183,11 @@ docker run -d \
   -e APP_ENV=production \
   -e LOG_LEVEL=INFO \
   omnisleuth:latest
+```
+
+### Docker Compose
+```bash
+docker compose up -d
 ```
 
 ### Verifying Container Health
@@ -181,8 +216,8 @@ curl -I http://localhost:8501/_stcore/health
   ```
 
 ### 2. SQLite Database Locked (`sqlite3.OperationalError: database is locked`)
-- **Cause:** A long-running write transaction or concurrent processes accessing SQLite without WAL mode.
-- **Mitigation:** OmniSleuth's `DatabaseManager` automatically configures `PRAGMA busy_timeout = 30000;` (30 seconds) on every connection. Ensure your local filesystem does not have network-drive file locking delays.
+- **Cause:** A long-running write transaction or concurrent processes accessing SQLite across an unsupported network filesystem.
+- **Mitigation:** OmniSleuth's `DatabaseManager` configures disk databases in Write-Ahead Logging mode (`PRAGMA journal_mode = WAL;`) and sets `PRAGMA busy_timeout = 30000;` (30 seconds) on every connection. Under WAL mode, readers do not block writers and writers do not block readers. Ensure database files are stored on local disks rather than network shares (NFS/CIFS).
 
 ### 3. OpenRouter API Key Error / Fallback Notice
 - **Symptom:** UI displays notice: `LLM planner selected but no provider is configured. Deterministic planner is used instead.`

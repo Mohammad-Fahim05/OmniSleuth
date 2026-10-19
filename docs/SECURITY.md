@@ -19,6 +19,7 @@ flowchart LR
 
 ### 1.1 Ingestion & File Upload Defenses
 - **Strict Size Ceilings:** Global 50 MB upload limit enforced before streaming to disk.
+- **Maximum Row Count Enforced:** Configurable row ceiling (`max_upload_rows`, default 1,000,000 rows) checked via bounded streaming/metadata inspection before loading unbounded files into memory.
 - **MIME & Magic Byte Inspection:** Inspects leading binary bytes to block disguised Windows PE (`MZ`), Linux ELF (`\x7fELF`), PNG, JPEG, PDF, and GZIP/XZ archives disguised as `.csv`.
 - **Excel OpenXML Structure Validation:** Verifies that `.xlsx` files contain valid OpenXML structures (`[Content_Types].xml`, `xl/workbook.xml`) and executes `zipfile.testzip()` to catch corrupted members.
 - **Decompression Bomb (ZIP-Bomb) Defense:** Enforces strict uncompressed-to-compressed size ratio checks and absolute uncompressed size limits during archive inspection.
@@ -36,9 +37,25 @@ flowchart LR
 - **Unsupported Claim Rejection:** If an answer makes factual claims that cannot be grounded in empirical tool evidence, the claim is flagged as unsupported or rejected.
 
 ### 1.4 SQLite Concurrency & Additive Migrations
+- **Write-Ahead Logging (WAL Mode):** During database initialization (`DatabaseManager.initialize_schema()`), disk databases execute `PRAGMA journal_mode = WAL;`. SQLite permanently records this setting in the database file header, enabling concurrent readers without blocking writers and writers without blocking readers across all subsequent connections. (In-memory databases `:memory:` safely remain in default `MEMORY` journal mode).
+- **WAL Sidecar Files & Backup Requirements:** In WAL mode, SQLite generates `<database>-wal` (write-ahead log) and `<database>-shm` (shared-memory index) sidecar files alongside the primary database file. To avoid capturing an inconsistent snapshot with uncommitted transactions, backups must be performed using the SQLite online backup API (`sqlite3 data/omnisleuth.db ".backup 'data/backup.db'"`) rather than raw filesystem copy commands while connections are active.
 - **Busy Timeout:** Database connections set `PRAGMA busy_timeout = 30000;` (30 seconds) to prevent concurrency locking errors during simultaneous read/write operations.
 - **Foreign Key Constraints:** `PRAGMA foreign_keys = ON;` enforces relational integrity between datasets, investigations, tool executions, and claims.
 - **Non-Destructive Additive Migrations:** Database schema updates only add missing columns (`ALTER TABLE ... ADD COLUMN`) and indices. No user data or prior audit history is dropped or overwritten.
+
+### 1.5 In-Memory Sliding-Window Rate Limiting (Per-Process)
+- **Session Rate Ceilings:** Enforces configurable sliding-window limits keyed by trusted session context:
+  - **Questions:** 30 questions per minute per session (`rate_limit_questions_per_minute = 30`).
+  - **Uploads:** 20 uploads per hour per session (`rate_limit_uploads_per_hour = 20`).
+- **Pre-Execution Rejection:** Rate-limited questions return blocked results immediately without invoking planners, LLMs, or tools. Rate-limited uploads are rejected before files are written to disk.
+- **Thread-Safe & Leak-Proof:** Thread-safe via internal mutex locking; expired timestamps and inactive session records are automatically pruned.
+- **Scope Notice:** In-memory limits are local to the running application process; they are not distributed across multi-instance clusters.
+
+### 1.6 Configurable Upload Retention Policy
+- **Configurable Retention Window:** Configured via `upload_retention_days` (default 30 days).
+- **Safe, Idempotent Cleanup:** Evaluates filesystem `st_mtime` against the retention window. Strictly contained within the configured upload directory.
+- **Database Reference Preservation:** Upload files actively referenced in the SQLite `datasets` table are preserved to ensure repository integrity.
+- **Explicit / Non-Automatic Invocation:** Cleanup is not executed automatically on application startup to avoid unreviewed deletions; it is triggered via administrative CLI (`omnisleuth cleanup-uploads`) or scheduled maintenance. Dry-run mode previews eligible deletions before execution.
 
 ---
 
@@ -49,12 +66,16 @@ flowchart LR
 - **Limitation:** This is a **pseudonymous browser session identifier**, not a cryptographic authentication token. It prevents accidental cross-tab data contamination within a single instance, but provides no user identity verification, password hashing, or role-based access control (RBAC).
 
 ### 2.2 Local SQLite & Single-Instance Concurrency
-- **Current State:** Storage uses a local SQLite database (`data/omnisleuth.db`) and local filesystem uploads (`data/uploads/`).
-- **Limitation:** SQLite is single-host storage. It cannot be safely mounted read-write across multiple concurrent container replicas or distributed nodes without risking database corruption.
+- **Current State:** Storage uses a local SQLite database (`data/omnisleuth.db`) and local filesystem uploads (`data/uploads/`). WAL mode is persistently configured on disk.
+- **Limitation:** SQLite is single-host storage. WAL mode relies on POSIX shared memory (`.shm`) and advisory filesystem locking, which are not distributed. It cannot be safely mounted read-write across multiple concurrent container replicas or distributed nodes without risking database corruption.
 
 ### 2.3 Absence of TLS / Security Headers in Streamlit
 - **Current State:** Streamlit's internal Uvicorn server serves raw HTTP on port 8501.
 - **Limitation:** Streamlit does not terminate TLS (HTTPS) and does not natively emit HSTS, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, or CSP headers.
+
+### 2.4 Container Root Filesystem & Non-Root Execution
+- **Current State:** The container executes as a dedicated non-root user (`appuser`, UID/GID 10001). Persistent volumes are mounted at `./data:/app/data` (for SQLite database, WAL/SHM sidecars, and uploads) and `./persisted_data:/app/persisted_data`. The container root filesystem is currently writable.
+- **Limitation & Hardening Boundary:** `read_only: true` is not currently enforced in Docker Compose. Streamlit requires write access for session state, internal caching (`/home/appuser/.streamlit`), logging (`/app/logs/omnisleuth.log`), and temporary files (`/tmp`). Enforcing a strict read-only root container filesystem in production requires operators to configure dedicated `tmpfs` mounts for `/tmp`, `/app/logs`, and `/home/appuser/.streamlit`.
 
 ---
 

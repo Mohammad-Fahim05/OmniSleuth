@@ -4,7 +4,7 @@
 
 OmniSleuth is a bounded, production-inspired AI/ML data investigation system designed to analyze structured business and operational datasets (e.g., sales, revenue, orders, inventory). Rather than acting like a naive conversational chatbot that hallucinates calculations and asserts unsubstantiated causal claims, OmniSleuth enforces **deterministic Python execution**, **allowlisted analytical tools**, **programmatic evidence provenance**, **hybrid contextual retrieval (RAG)**, **finite state machine orchestration**, **dual-layer guardrails**, and a **production-grade LLM Gateway with deterministic offline fallback**.
 
-The entire system is **100% offline-first reproducible**, executing all 509 unit, integration, and security tests, ML detectors, hybrid retrieval pipelines, and empirical evaluations without external network access or paid API keys.
+The entire system is **100% offline-first reproducible**, executing comprehensive unit, integration, and security tests (552 passed in the Phase E verification run), ML detectors, hybrid retrieval pipelines, and empirical evaluations without external network access or paid API keys.
 
 ---
 
@@ -319,7 +319,7 @@ cp .env.example .env
 ```
 
 ### 4. Run the Full Test Suite
-Execute the 105-test suite:
+Execute the automated test suite (552 tests passed in the Phase E verification run):
 ```bash
 python -m pytest -v
 ```
@@ -365,8 +365,8 @@ curl http://localhost:8501/_stcore/health
 ```
 
 ### 3. Cloud Deployment Readiness
-- **Google Cloud Run**: Compatible with dynamic `$PORT` environment variable injection and non-root execution.
-- **AWS ECS / Fargate**: Compatible with container health checks and stateless horizontal scaling.
+- **Google Cloud Run**: Compatible with dynamic `$PORT` environment variable injection and non-root execution for single-container deployment.
+- **AWS ECS / Fargate**: Compatible with container health checks for single-instance container execution. Note: SQLite WAL mode requires single-host persistent storage and does not support multi-instance horizontal scaling.
 
 ---
 
@@ -398,10 +398,10 @@ OmniSleuth/
 │   ├── llm/                       # Centralized LLM Gateway (providers, retries, cache, tracing)
 │   ├── persistence/               # SQLite repository and JSON state serializer
 │   └── ui/                        # Streamlit multi-tab analytical UI
-├── tests/                         # 105 comprehensive unit and integration tests
+├── tests/                         # Automated unit, integration, and security test suite (552 tests in Phase E run)
 ├── .dockerignore                  # Docker build context exclusions
 ├── .env.example                   # Environment configuration template
-├── docker-compose.yml             # Local multi-container compose specification
+├── docker-compose.yml             # Local container compose specification with persistent mounts
 ├── Dockerfile                     # Multi-stage, non-root hardened containerfile
 ├── pyproject.toml                 # Packaging metadata and pytest configuration
 ├── README.md                      # Primary project documentation

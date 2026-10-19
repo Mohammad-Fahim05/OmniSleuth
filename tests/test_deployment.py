@@ -107,3 +107,33 @@ def test_packaging_and_environment_files():
     assert (REPO_ROOT / ".env.example").exists(), ".env.example must exist."
     assert (REPO_ROOT / "omnisleuth" / "ui" / "app.py").exists(), "Streamlit app.py entrypoint must exist."
     assert (REPO_ROOT / "omnisleuth" / "cli.py").exists(), "CLI entrypoint must exist."
+
+
+def test_docker_security_audit_claims():
+    """Phase E audit: verify non-root user, persistent volume paths, and filesystem permissions."""
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    compose = (REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+
+    # 1. Non-root user compliance
+    assert "groupadd -g 10001 appuser" in dockerfile
+    assert "useradd -u 10001" in dockerfile
+    assert "USER appuser" in dockerfile
+
+    # 2. Dedicated directory ownership for non-root user
+    assert "/app/data/uploads" in dockerfile
+    assert "/app/logs" in dockerfile
+    assert "/home/appuser/.streamlit" in dockerfile
+    assert "chown -R appuser:appuser" in dockerfile
+
+    # 3. Persistent SQLite & upload storage volume in compose
+    assert "./data:/app/data" in compose
+    assert "SQLITE_DB_PATH=/app/data/omnisleuth.db" in compose
+    assert "UPLOADS_DIR=/app/data/uploads" in compose
+
+    # 4. Verified healthcheck and port mapping
+    assert "8501:8501" in compose
+    assert "/_stcore/health" in compose
+
+    # 5. Root filesystem in compose is standard writable (not read_only)
+    # Streamlit, SQLite WAL sidecars, and logging require writable target paths
+    assert "read_only: true" not in compose

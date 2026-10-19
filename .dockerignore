@@ -40,8 +40,14 @@ omnisleuth.egg-info/
 data/
 persisted_data/
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
+*.sqlite-wal
+*.sqlite-shm
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Local audit & frozen compliance artifacts
 audit/
