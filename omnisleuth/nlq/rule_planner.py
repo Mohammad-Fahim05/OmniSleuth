@@ -83,10 +83,12 @@ class RulePlanner:
                 planner="deterministic",
             )
 
-        # 3. Check for documentation / glossary questions
-        if any(term in q_lower for term in ("definition of", "formula for", "what is aov", "business rule")):
+        # 3. Check for documentation / glossary / definitional questions
+        if self._is_documentation_question(q_lower):
+            target_col = self._resolve_target_column_any(q_lower, schema_ctx)
             return AnalysisPlan(
                 intent=PlanIntent.DOCUMENTATION_QUESTION,
+                target_column=target_col,
                 confidence=0.9,
                 planner="deterministic",
             )
@@ -240,6 +242,78 @@ class RulePlanner:
             r"translate\s+to",
         ]
         return any(re.search(pat, q_lower) for pat in gk_patterns)
+
+    def _is_documentation_question(self, q_lower: str) -> bool:
+        """Identify definitional, glossary, and explanatory documentation inquiries."""
+        # 1. Causal/diagnostic questions take precedence
+        diagnostic_terms = (
+            "why did", "why is", "root cause", "explain the drop", "explain why",
+            "reason for decline", "reason for drop", "what caused", "what is causing",
+            "what drove", "driver of",
+        )
+        if any(term in q_lower for term in diagnostic_terms):
+            return False
+
+        # 2. Definitional / explanatory phrasing patterns
+        doc_patterns = [
+            r"\bdefinition\s+of\b",
+            r"\bformula\s+for\b",
+            r"\bwhat\s+is\s+aov\b",
+            r"\bbusiness\s+rules?\b",
+            r"\bmeaning\s+of\b",
+            r"\bwhat\s+is\s+meant\s+by\b",
+            r"\bwhat\s+does\b.+\bmean\b",
+            r"\bwhat\s+do\b.+\bmean\b",
+            r"\bwhat\s+does\b.+\brepresent\b",
+            r"\bwhat\s+do\b.+\brepresent\b",
+            r"\bexplain\s+what\b.+\bmeans?\b",
+            r"\bexplain\s+what\s+is\b",
+            r"\bexplain\s+what\b.+\b(is|are)\b",
+            r"\bhow\s+is\b.+\b(defined|calculated|computed)\b",
+            r"\bdescribe\s+(the\s+)?column\b",
+            r"\bglossary\b",
+        ]
+        if not any(re.search(pat, q_lower) for pat in doc_patterns):
+            return False
+
+        # 3. Guard against queries that include both aggregation and grouping keywords
+        has_agg = any(w in q_lower for w in ("average", "mean", "avg", "total", "sum", "median", "count", "how many", "max", "min"))
+        has_group = any(w in q_lower for w in ("by ", "per ", "across ", "breakdown"))
+        if has_agg and has_group:
+            return False
+
+        return True
+
+    def _resolve_target_column_any(self, q_lower: str, schema_ctx: SchemaContext) -> Optional[str]:
+        """Identify any dataset column (numeric, categorical, date, or other) targeted by the question."""
+        # 1. Numeric column resolution (exact name, synonyms, fuzzy)
+        target_num = self._resolve_target_numeric_column(q_lower, schema_ctx)
+        if target_num:
+            return target_num
+
+        # 2. Exact match on any column name in schema
+        for col in schema_ctx.columns.keys():
+            col_normalized = col.lower().replace("_", " ")
+            pattern = rf"\b{re.escape(col_normalized)}\b|\b{re.escape(col.lower())}\b"
+            if re.search(pattern, q_lower):
+                return col
+
+        # 3. Synonym match against any column
+        for col in schema_ctx.columns.keys():
+            syns = self.SYNONYMS.get(col.lower(), [])
+            for s in syns:
+                if re.search(rf"\b{re.escape(s)}\b", q_lower):
+                    return col
+
+        # 4. Fuzzy token match across all schema columns
+        tokens = re.findall(r"\b[a-zA-Z_]+\b", q_lower)
+        all_cols = list(schema_ctx.columns.keys())
+        for tok in tokens:
+            matches = difflib.get_close_matches(tok, all_cols, n=1, cutoff=0.85)
+            if matches:
+                return matches[0]
+
+        return None
 
     def _plan_flexible_query(self, q_lower: str, schema_ctx: SchemaContext) -> Optional[AnalysisPlan]:
         """Construct a structured Query plan for flexible aggregation and filtering."""

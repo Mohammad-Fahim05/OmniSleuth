@@ -371,6 +371,15 @@ class AnalysisPipeline:
                         plan = rule_plan
                         if disagreement_note not in plan.assumptions:
                             plan.assumptions.append(disagreement_note)
+                    elif (
+                        rule_plan.intent == PlanIntent.DOCUMENTATION_QUESTION
+                        and plan.intent == PlanIntent.GENERAL_KNOWLEDGE
+                        and rule_plan.target_column
+                        and rule_plan.target_column in schema_ctx.columns
+                    ):
+                        plan = rule_plan
+                        if disagreement_note not in plan.assumptions:
+                            plan.assumptions.append(disagreement_note)
                     else:
                         if disagreement_note not in plan.assumptions:
                             plan.assumptions.append(disagreement_note)

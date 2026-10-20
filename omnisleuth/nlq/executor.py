@@ -1,6 +1,7 @@
 """Executor: Deterministic execution of validated AnalysisPlans with evidence grounding."""
 
 import math
+import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
@@ -113,6 +114,8 @@ class PlanExecutor:
                 return self._execute_trend(plan, df, metadata, store, inv_id)
             elif plan.intent in (PlanIntent.QUERY, PlanIntent.CHART_REQUEST):
                 return self._execute_query(plan, df, metadata, store, inv_id, question)
+            elif plan.intent == PlanIntent.DOCUMENTATION_QUESTION:
+                return self._execute_documentation_question(plan, df, metadata, store, inv_id, question)
             else:
                 return QueryResult(
                     status="unsupported",
@@ -242,6 +245,242 @@ class PlanExecutor:
             plan=plan,
             plain_language_summary=f"Profiled {row_cnt:,} rows and {col_cnt} columns.",
             planner_used=plan.planner,
+            investigation_id=inv_id,
+        )
+
+    def _execute_documentation_question(
+        self,
+        plan: AnalysisPlan,
+        df: pd.DataFrame,
+        metadata: DatasetMetadata,
+        store: EvidenceStore,
+        inv_id: str,
+        question: Optional[str] = None,
+    ) -> QueryResult:
+        """Execute documentation / glossary inquiry with empirical dataset grounding."""
+        # 1. Resolve target column from plan or question text
+        target_col = plan.target_column
+        if not target_col or target_col not in df.columns:
+            if question:
+                q_low = question.lower()
+                for col in df.columns:
+                    col_norm = col.lower().replace("_", " ")
+                    pat = rf"\b{re.escape(col_norm)}\b|\b{re.escape(col.lower())}\b"
+                    if re.search(pat, q_low):
+                        target_col = col
+                        break
+
+        # Suggestion helpers
+        suggested_cat = (
+            metadata.categorical_columns[0]
+            if getattr(metadata, "categorical_columns", None)
+            else "category"
+        )
+        suggested_num = (
+            metadata.numeric_columns[0]
+            if getattr(metadata, "numeric_columns", None)
+            else "revenue"
+        )
+
+        # 2. Case A: Target column found in dataset
+        if target_col and target_col in df.columns:
+            series = df[target_col]
+            total_rows = len(df)
+            non_null = int(series.count())
+            missing = int(series.isna().sum())
+            unique_cnt = int(series.nunique())
+            dtype_str = str(series.dtype)
+
+            col_meta = next((c for c in metadata.columns if c.name == target_col), None)
+            col_type = col_meta.data_type.value if col_meta else "unspecified"
+
+            is_numeric = pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series)
+
+            payload: Dict[str, Any] = {
+                "target_column": target_col,
+                "data_type": col_type,
+                "dtype": dtype_str,
+                "total_rows": total_rows,
+                "non_null_count": non_null,
+                "missing_count": missing,
+                "unique_count": unique_cnt,
+            }
+
+            table_rows = [
+                {"Property": "Column Name", "Value": str(target_col)},
+                {"Property": "Inferred Data Type", "Value": str(col_type)},
+                {"Property": "Physical Dtype", "Value": str(dtype_str)},
+                {"Property": "Total Rows", "Value": f"{total_rows}"},
+                {"Property": "Populated Values", "Value": f"{non_null}"},
+                {"Property": "Missing Values", "Value": f"{missing}"},
+                {"Property": "Unique Values", "Value": f"{unique_cnt}"},
+            ]
+
+            if is_numeric and non_null > 0:
+                min_val = round(float(series.min()), 2)
+                max_val = round(float(series.max()), 2)
+                mean_val = round(float(series.mean()), 2)
+                median_val = round(float(series.median()), 2)
+
+                payload.update({
+                    "min": min_val,
+                    "max": max_val,
+                    "mean": mean_val,
+                    "median": median_val,
+                })
+
+                table_rows.extend([
+                    {"Property": "Min Value", "Value": f"{min_val:,.2f}"},
+                    {"Property": "Max Value", "Value": f"{max_val:,.2f}"},
+                    {"Property": "Mean Value", "Value": f"{mean_val:,.2f}"},
+                    {"Property": "Median Value", "Value": f"{median_val:,.2f}"},
+                ])
+
+                statement = (
+                    f"Column '{target_col}' has {non_null} populated values with {unique_cnt} unique values "
+                    f"and {missing} missing values (min: {min_val:.2f}, max: {max_val:.2f}, mean: {mean_val:.2f})."
+                )
+
+                extracted_numbers = [
+                    float(non_null),
+                    float(unique_cnt),
+                    float(missing),
+                    float(min_val),
+                    float(max_val),
+                    float(mean_val),
+                ]
+
+                answer = (
+                    f"In dataset '{metadata.name}', '{target_col}' is a {col_type} column ({dtype_str}) "
+                    f"with {non_null:,} values ranging from {min_val:,.2f} to {max_val:,.2f} "
+                    f"(mean: {mean_val:,.2f}, median: {median_val:,.2f}, unique: {unique_cnt:,}, missing: {missing:,}).\n\n"
+                    f"**Data Grounding Note:** Dataset metadata and empirical distributions describe how '{target_col}' is stored "
+                    f"and distributed, but do not provide domain-specific business definitions or accounting formulas "
+                    f"(such as gross vs. net calculations, tax handling, or discounts). "
+                    f"Please consult domain documentation for formal business definitions.\n\n"
+                    f"**Suggested Analytical Questions:**\n"
+                    f"- What is the total {target_col}?\n"
+                    f"- What is the average {target_col} by {suggested_cat}?\n"
+                    f"- What is the monthly trend of {target_col}?"
+                )
+            else:
+                statement = (
+                    f"Column '{target_col}' has {non_null} populated values with {unique_cnt} unique values "
+                    f"and {missing} missing values."
+                )
+                extracted_numbers = [float(non_null), float(unique_cnt), float(missing)]
+
+                samples = [str(x) for x in series.dropna().unique()[:5]]
+                if samples:
+                    table_rows.append({"Property": "Sample Values", "Value": ", ".join(samples)})
+
+                answer = (
+                    f"In dataset '{metadata.name}', '{target_col}' is a {col_type} column ({dtype_str}) "
+                    f"with {non_null:,} populated values ({unique_cnt:,} unique, {missing:,} missing).\n\n"
+                    f"**Data Grounding Note:** Column metadata reflects schema type and empirical values, "
+                    f"not business glossary rules or metric definitions.\n\n"
+                    f"**Suggested Analytical Questions:**\n"
+                    f"- How many records are there by {target_col}?\n"
+                    f"- Which {target_col} has the highest {suggested_num}?"
+                )
+
+            ev = EvidenceItem(
+                evidence_id=f"ev_doc_{uuid.uuid4().hex[:6]}",
+                evidence_type=EvidenceType.DETERMINISTIC_CALC,
+                source_id="documentation_question",
+                location=f"{metadata.name}:{target_col}",
+                content=payload,
+                confidence=1.0,
+            )
+            store.add_evidence(ev)
+
+            claim = Claim(
+                statement=statement,
+                extracted_numbers=extracted_numbers,
+                status=ClaimStatus.SUPPORTED,
+            )
+            self.claim_validator.validate_all([claim], store)
+            store.add_claim(claim)
+
+            self._persist_results(inv_id, metadata, question or f"Explain {target_col}", statement, plan, store)
+
+            return QueryResult(
+                status="answered",
+                answer=answer,
+                result_table=table_rows,
+                evidence_store=store,
+                claims=[claim],
+                plan=plan,
+                plain_language_summary=f"Provided schema and distribution profile for column '{target_col}' in dataset '{metadata.name}'.",
+                planner_used=plan.planner,
+                limitations=[
+                    "Dataset metadata provides empirical data characteristics; formal business definitions require domain documentation."
+                ],
+                investigation_id=inv_id,
+            )
+
+        # 3. Case B: Target column NOT found in dataset (general question or unmapped metric)
+        available_cols = [c.name for c in metadata.columns] if metadata.columns else list(df.columns)
+        available_str = ", ".join(sorted(available_cols))
+
+        table_rows = [
+            {"Column": c.name, "Type": c.data_type.value, "Unique Count": c.unique_count, "Missing": c.missing_count}
+            for c in metadata.columns[:50]
+        ] if metadata.columns else []
+
+        payload = {
+            "available_columns": available_cols,
+            "column_count": len(available_cols),
+        }
+        ev = EvidenceItem(
+            evidence_id=f"ev_doc_{uuid.uuid4().hex[:6]}",
+            evidence_type=EvidenceType.DETERMINISTIC_CALC,
+            source_id="documentation_question",
+            location=metadata.name,
+            content=payload,
+            confidence=1.0,
+        )
+        store.add_evidence(ev)
+
+        missing_mention = f" for '{target_col}'" if target_col else ""
+        statement = (
+            f"Business definitions and metric formulas{missing_mention} are not embedded in dataset metadata. "
+            f"The dataset contains {len(available_cols)} columns."
+        )
+        claim = Claim(
+            statement=statement,
+            extracted_numbers=[float(len(available_cols))],
+            status=ClaimStatus.SUPPORTED,
+        )
+        self.claim_validator.validate_all([claim], store)
+        store.add_claim(claim)
+
+        answer = (
+            f"Business definitions and metric formulas{missing_mention} are not embedded in dataset metadata. "
+            f"Dataset '{metadata.name}' contains the following available columns: {available_str}.\n\n"
+            f"**Data Grounding Note:** While empirical data can compute aggregations, distributions, and trends, "
+            f"formal business definitions (such as accounting policies or metric calculations) must be verified "
+            f"against business domain documentation.\n\n"
+            f"**Suggested Analytical Questions:**\n"
+            f"- What is the total {suggested_num}?\n"
+            f"- What is the average {suggested_num} by {suggested_cat}?\n"
+            f"- Describe dataset overview"
+        )
+
+        self._persist_results(inv_id, metadata, question or "Documentation question", statement, plan, store)
+
+        return QueryResult(
+            status="answered",
+            answer=answer,
+            result_table=table_rows,
+            evidence_store=store,
+            claims=[claim],
+            plan=plan,
+            plain_language_summary=f"General dataset documentation and available columns for '{metadata.name}'.",
+            planner_used=plan.planner,
+            limitations=[
+                "Business definitions and metric formulas are not embedded in dataset metadata."
+            ],
             investigation_id=inv_id,
         )
 

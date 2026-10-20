@@ -556,7 +556,8 @@ class LLMPlanner:
             "PLANNING_RULES:\n"
             '- "per <identifier>" is not a group-by (e.g. "average units_sold per order" means compute mean of units_sold, not group by order_id).\n'
             '- "which X contributed most" is the contribution intent (do not plan a query limited to 1 group).\n'
-            '- why-questions are deep_investigation (e.g. "why did revenue decline in March?", "what drove the drop").'
+            '- why-questions are deep_investigation (e.g. "why did revenue decline in March?", "what drove the drop").\n'
+            '- questions asking to explain, define, or describe a column in the dataset (e.g. "explain what is revenue", "what does revenue mean") are documentation_question with target_column set to that column, not general_knowledge.'
         )
 
         user_prompt = (
