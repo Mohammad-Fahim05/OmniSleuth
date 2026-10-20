@@ -416,6 +416,11 @@ def test_four_group_regional_query_displays_all_four_regions(test_dataset):
     assert "(4 groups):" in result.answer
     assert "4. " in result.answer, f"Fourth group item number missing from answer: {result.answer}"
 
+    # 4. Grouped aggregation claim receives SUPPORTED status and links supporting evidence
+    assert len(result.claims) == 1
+    assert result.claims[0].status == ClaimStatus.SUPPORTED
+    assert len(result.claims[0].supporting_evidence_ids) > 0
+
 
 def test_group_by_with_many_groups_explicitly_notes_subset():
     """Defect B: When groups exceed display limit, answer explicitly states subset."""

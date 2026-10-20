@@ -51,7 +51,16 @@ class ClaimValidator:
 
     def extract_numbers_from_text(self, text: str) -> List[float]:
         """Extract all floating-point and percentage values from text."""
-        matches = NUMERIC_REGEX.findall(text)
+        # 1. Strip date patterns like YYYY-MM-DD or YYYY-MM so calendar years/months aren't treated as metric claims
+        cleaned = re.sub(r"\b\d{4}-\d{2}(?:-\d{2})?\b", "", text)
+        # 2. Remove comma thousands separators between digits (e.g. 1,000 or $398,325.40)
+        cleaned = re.sub(r"(?<=\d),(?=\d{3}(?:\b|[^\d]))", "", cleaned)
+        # 3. Strip numbered list prefixes (e.g. '1. North', '2. West')
+        cleaned = re.sub(r"(?:^|(?<=[\s,;(]))\d+\.\s+(?=[A-Za-z])", "", cleaned)
+        # 4. Strip group count descriptors (e.g. '(4 groups)', 'showing top 10 of 15 groups')
+        cleaned = re.sub(r"\b(?:\d+\s+groups?|showing top \d+ of \d+ groups)\b", "", cleaned, flags=re.IGNORECASE)
+
+        matches = NUMERIC_REGEX.findall(cleaned)
         numbers: List[float] = []
         for m in matches:
             clean_str = m.rstrip("%")
@@ -104,6 +113,10 @@ class ClaimValidator:
         """Programmatically validate a claim against the EvidenceStore."""
         statement = claim.statement
         claim_numbers = self.extract_numbers_from_text(statement)
+        if not claim_numbers and claim.extracted_numbers:
+            claim_numbers = list(claim.extracted_numbers)
+        elif not claim.extracted_numbers and claim_numbers:
+            claim.extracted_numbers = list(claim_numbers)
         has_causal, causal_words, calibrated_text = self.check_unsupported_causality(statement)
 
         evidence_items = store.list_evidence()

@@ -1013,6 +1013,7 @@ class PlanExecutor:
                     "filters_applied": applied_filter_notes,
                     "rows_before": initial_rows,
                     "rows_after": filtered_rows,
+                    "group_count": len(result_table),
                     "records": result_table,
                 },
                 confidence=1.0,
